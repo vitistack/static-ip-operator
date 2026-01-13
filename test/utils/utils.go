@@ -62,7 +62,7 @@ func Run(cmd *exec.Cmd) (string, error) {
 // UninstallCertManager uninstalls the cert manager
 func UninstallCertManager() {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url)
+	cmd := exec.Command("kubectl", "delete", "-f", url) // #nosec G204 -- url is constructed from trusted constants
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
 	}
@@ -73,7 +73,7 @@ func UninstallCertManager() {
 		"cert-manager-controller",
 	}
 	for _, lease := range kubeSystemLeases {
-		cmd = exec.Command("kubectl", "delete", "lease", lease,
+		cmd = exec.Command("kubectl", "delete", "lease", lease, // #nosec G204 -- lease is from trusted constant slice
 			"-n", "kube-system", "--ignore-not-found", "--force", "--grace-period=0")
 		if _, err := Run(cmd); err != nil {
 			warnError(err)
@@ -84,7 +84,7 @@ func UninstallCertManager() {
 // InstallCertManager installs the cert manager bundle.
 func InstallCertManager() error {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
+	cmd := exec.Command("kubectl", "apply", "-f", url) // #nosec G204 -- url is constructed from trusted constants
 	if _, err := Run(cmd); err != nil {
 		return err
 	}
@@ -144,7 +144,7 @@ func LoadImageToKindClusterWithName(name string) error {
 	if v, ok := os.LookupEnv("KIND"); ok {
 		kindBinary = v
 	}
-	cmd := exec.Command(kindBinary, kindOptions...)
+	cmd := exec.Command(kindBinary, kindOptions...) // #nosec G204 -- kindBinary and kindOptions are from trusted sources
 	_, err := Run(cmd)
 	return err
 }
@@ -176,9 +176,7 @@ func GetProjectDir() (string, error) {
 // UncommentCode searches for target in the file and remove the comment prefix
 // of the target content. The target content may span multiple lines.
 func UncommentCode(filename, target, prefix string) error {
-	// false positive
-	// nolint:gosec
-	content, err := os.ReadFile(filename)
+	content, err := os.ReadFile(filename) // #nosec G304 -- filename is provided by test code
 	if err != nil {
 		return fmt.Errorf("failed to read file %q: %w", filename, err)
 	}
@@ -216,9 +214,7 @@ func UncommentCode(filename, target, prefix string) error {
 		return fmt.Errorf("failed to write to output: %w", err)
 	}
 
-	// false positive
-	// nolint:gosec
-	if err = os.WriteFile(filename, out.Bytes(), 0644); err != nil {
+	if err = os.WriteFile(filename, out.Bytes(), 0600); err != nil {
 		return fmt.Errorf("failed to write file %q: %w", filename, err)
 	}
 
