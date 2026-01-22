@@ -23,6 +23,9 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"github.com/spf13/viper"
+	"github.com/vitistack/common/pkg/loggers/vlog"
+	"github.com/vitistack/static-ip-operator/internal/consts"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -81,7 +84,22 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	// Set up the logger
+	vlogSetup := vlog.Options{
+		Level:             viper.GetString(consts.LOG_LEVEL),
+		ColorizeLine:      viper.GetBool(consts.LOG_COLORIZE_LINE),
+		AddCaller:         viper.GetBool(consts.LOG_ADD_CALLER),
+		DisableStacktrace: viper.GetBool(consts.LOG_DISABLE_STACKTRACE),
+		UnescapeMultiline: viper.GetBool(consts.LOG_UNESCAPED_MULTILINE),
+		JSON:              viper.GetBool(consts.LOG_JSON),
+	}
+	_ = vlog.Setup(vlogSetup)
+	defer func() {
+		_ = vlog.Sync()
+	}()
+
+	ctrl.SetLogger(vlog.Logr())
+	// ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
