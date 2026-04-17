@@ -11,19 +11,22 @@ rules:
   verbs:
   - get
   - list
-  - watch
-  - update
   - patch
+  - update
+  - watch
 - apiGroups:
   - vitistack.io
   resources:
   - controlplanevirtualsharedips/finalizers
+  - networkconfigurations/finalizers
   verbs:
   - update
 - apiGroups:
   - vitistack.io
   resources:
   - controlplanevirtualsharedips/status
+  - networkconfigurations/status
+  - networknamespaces/status
   verbs:
   - get
   - patch
@@ -40,21 +43,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - vitistack.io
-  resources:
-  - networkconfigurations/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - vitistack.io
-  resources:
-  - networkconfigurations/status
-  - networknamespaces/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - vitistack.io
   resources:
