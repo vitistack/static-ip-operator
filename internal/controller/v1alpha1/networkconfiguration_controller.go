@@ -484,9 +484,7 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 	// and other consumers can use them (ipv4Prefix for subnet info, vlanId
 	// for NetworkAttachmentDefinition creation).
 	updated.Status.IPv4Prefix = staticCfg.IPv4CIDR
-	if staticCfg.VlanID > 0 {
-		updated.Status.VlanID = staticCfg.VlanID
-	}
+	updated.Status.VlanID = staticCfg.VlanID
 
 	if updated.Status.IPAllocationStatus == nil {
 		updated.Status.IPAllocationStatus = &vitistackcrdsv1alpha1.NetworkNamespaceIPAllocationStatus{}
