@@ -63,35 +63,43 @@ func (r *ControlPlaneVirtualSharedIPReconciler) Reconcile(ctx context.Context, r
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("reconciling ControlPlaneVirtualSharedIP",
-		"name", cpvip.Name, "namespace", req.Namespace, "generation", cpvip.GetGeneration())
+	// --- Triage phase: determine ownership silently before any INFO logs. ---
 
-	// Look up the referenced NetworkNamespace
 	nnName := strings.TrimSpace(cpvip.Spec.NetworkNamespaceIdentifier)
 	if nnName == "" {
-		log.Info("no networkNamespaceIdentifier set, skipping")
+		log.V(1).Info("skipping ControlPlaneVirtualSharedIP, no networkNamespaceIdentifier set",
+			"name", cpvip.Name, "namespace", req.Namespace)
 		return ctrl.Result{}, nil
 	}
 
 	nn := &vitistackcrdsv1alpha1.NetworkNamespace{}
 	if err := r.Get(ctx, client.ObjectKey{Name: nnName, Namespace: req.Namespace}, nn); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("referenced NetworkNamespace not found, requeuing", "networkNamespace", nnName)
+			// Can't determine ownership without the NN. Requeue so we pick
+			// it up when the NN is created, but don't log at INFO — the CPVIP
+			// may belong to another operator.
+			log.V(1).Info("referenced NetworkNamespace not found, requeuing",
+				"networkNamespace", nnName, "name", cpvip.Name, "namespace", req.Namespace)
 			return ctrl.Result{RequeueAfter: cpvipRequeueDelay}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Provider check: only handle if NN uses static-ip-operator.
-	// This runs before adding a finalizer to avoid claiming resources
-	// that belong to the nms-operator.
+	// Only handle NetworkNamespaces that explicitly use static-ip-operator
+	// (type=static AND provider=static-ip-operator). Everything else belongs
+	// to another operator — skip silently so we don't spam logs.
 	if nn.Spec.IPAllocation == nil ||
 		nn.Spec.IPAllocation.Type != vitistackcrdsv1alpha1.IPAllocationTypeStatic ||
 		!vitistackcrdsv1alpha1.MatchesProvider(nn.Spec.IPAllocation.Provider, vitistackcrdsv1alpha1.ProviderNameStaticIP) {
-		log.V(1).Info("NetworkNamespace does not use static-ip-operator, skipping",
+		log.V(1).Info("skipping ControlPlaneVirtualSharedIP, NetworkNamespace does not use static-ip-operator",
 			"networkNamespace", nnName)
 		return ctrl.Result{}, nil
 	}
+
+	// --- Past triage: this CPVIP is ours. ---
+
+	log.Info("reconciling ControlPlaneVirtualSharedIP",
+		"name", cpvip.Name, "namespace", req.Namespace, "generation", cpvip.GetGeneration())
 
 	// Handle deletion
 	if !cpvip.GetDeletionTimestamp().IsZero() {

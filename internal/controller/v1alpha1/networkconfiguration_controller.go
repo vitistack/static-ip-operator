@@ -21,7 +21,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,12 +31,25 @@ import (
 	viticommonfinalizers "github.com/vitistack/common/pkg/operator/finalizers"
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
+	"github.com/vitistack/static-ip-operator/internal/consts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// deprecationWarned tracks resources for which a deprecation notice has already
+// been logged, so we don't spam the logs on every reconcile loop.
+var deprecationWarned sync.Map
+
+// strictDefaultsEnabled reports whether STATIC_IP_STRICT_DEFAULTS is set to a
+// truthy value. When true, the operator refuses to treat unset fields as
+// defaults and instead surfaces an error — forcing migration to explicit config.
+func strictDefaultsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(consts.STATIC_IP_STRICT_DEFAULTS)))
+	return v == "true" || v == "1" || v == "yes"
+}
 
 const (
 	finalizerName              = "vitistack.io/static-ip-finalizer"
@@ -69,47 +84,69 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("reconciling NetworkConfiguration",
-		"name", nc.Name, "namespace", req.Namespace, "generation", nc.GetGeneration())
-
-	// Check spec.provider early — before adding a finalizer — to avoid claiming
-	// resources that belong to another operator.
-	// Unset/empty = determine from NetworkNamespace (backward compatible).
-	// "static-ip-operator" (case-insensitive) = explicitly ours.
-	// Anything else (e.g. "kea") = not ours, skip.
+	// Provider triage — if spec.provider is explicitly set to something other
+	// than 'static-ip-operator', this NC belongs to another operator. Skip
+	// silently so we don't spam logs for resources that aren't ours.
 	if vitistackcrdsv1alpha1.IsProviderSet(nc.Spec.Provider) &&
 		!vitistackcrdsv1alpha1.MatchesProvider(nc.Spec.Provider, vitistackcrdsv1alpha1.ProviderNameStaticIP) {
-		log.Info("skipping NetworkConfiguration, provider is not 'static-ip-operator'",
+		log.V(1).Info("skipping NetworkConfiguration, provider is not 'static-ip-operator'",
 			"provider", nc.Spec.Provider, "name", nc.Name, "namespace", req.Namespace)
 		return ctrl.Result{}, nil
 	}
 
-	// Handle deletion
+	// Handle deletion before triage: if the NC has our finalizer we must run
+	// cleanup regardless of the NN's current state.
 	if !nc.GetDeletionTimestamp().IsZero() {
 		return r.handleDeletion(ctx, nc, log)
 	}
 
-	// Get the NetworkNamespace
-	nn, err := r.getNetworkNamespace(ctx, req.Namespace, nc.Spec.NetworkNamespaceName)
+	// Fetch the NetworkNamespace silently. We need it to decide whether this
+	// NC is actually ours (type=static) before logging anything.
+	nn, fallbackUsed, fallbackCount, err := r.getNetworkNamespace(ctx, req.Namespace, nc.Spec.NetworkNamespaceName)
 	if err != nil {
-		log.Error(err, "failed to get NetworkNamespace",
-			"networkConfiguration", nc.Name, "networkNamespaceName", nc.Spec.NetworkNamespaceName, "namespace", req.Namespace)
-		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+		// Can't determine ownership — log at V(1) so we don't spam for
+		// resources that likely aren't ours.
+		log.V(1).Info("unable to fetch NetworkNamespace for triage",
+			"networkConfiguration", nc.Name, "networkNamespaceName", nc.Spec.NetworkNamespaceName, "namespace", req.Namespace, "error", err.Error())
+		return ctrl.Result{}, nil
 	}
 
-	log.Info("found NetworkNamespace",
-		"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
-
-	// Only handle NetworkNamespaces with static IP allocation
+	// Type triage — this operator only handles type=static. Anything else
+	// (nil → DHCP default, explicit dhcp, anything non-static) belongs to
+	// another operator. Skip silently.
 	if nn.Spec.IPAllocation == nil {
-		log.Info("NetworkNamespace does not have spec.ipAllocation configured, skipping",
+		log.V(1).Info("skipping NetworkConfiguration, NetworkNamespace has no ipAllocation (DHCP default)",
 			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
 		return ctrl.Result{}, nil
 	}
 	if nn.Spec.IPAllocation.Type != vitistackcrdsv1alpha1.IPAllocationTypeStatic {
-		log.Info("NetworkNamespace ipAllocation type is not 'static', skipping",
+		log.V(1).Info("skipping NetworkConfiguration, NetworkNamespace ipAllocation type is not 'static'",
 			"type", nn.Spec.IPAllocation.Type, "networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
 		return ctrl.Result{}, nil
+	}
+
+	// --- Past triage: this NC is ours (type=static). ---
+
+	log.Info("reconciling NetworkConfiguration",
+		"name", nc.Name, "namespace", req.Namespace, "generation", nc.GetGeneration())
+
+	log.Info("found NetworkNamespace",
+		"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
+
+	// Warn (once) about the fallback NN lookup when we're actually handling
+	// this NC, so we don't emit it for resources that belong elsewhere.
+	if fallbackUsed {
+		if _, alreadyWarned := deprecationWarned.LoadOrStore("nnname-"+req.Namespace, true); !alreadyWarned {
+			log.Info("WARNING: NetworkConfiguration has no spec.networkNamespaceName set; "+
+				"falling back to listing all NetworkNamespaces in namespace for backward compatibility. "+
+				"Please set spec.networkNamespaceName explicitly. "+
+				"Set STATIC_IP_STRICT_DEFAULTS=true to force migration.",
+				"namespace", req.Namespace)
+		}
+		if fallbackCount > 1 {
+			log.Info("WARNING: multiple NetworkNamespaces found in namespace, using first one",
+				"namespace", req.Namespace, "count", fallbackCount, "selected", nn.Name)
+		}
 	}
 
 	staticCfg := nn.Spec.IPAllocation.Static
@@ -393,7 +430,7 @@ func (r *NetworkConfigurationReconciler) handleDeletion(ctx context.Context, nc 
 	log.Info("removed finalizer, deletion complete", "name", nc.Name, "namespace", nc.Namespace)
 
 	// Recalculate NetworkNamespace IP allocation status now that this NC's IPs are released
-	nn, err := r.getNetworkNamespace(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName)
+	nn, _, _, err := r.getNetworkNamespace(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName)
 	if err != nil {
 		log.Error(err, "failed to get NetworkNamespace during deletion cleanup, status may be stale",
 			"name", nc.Name, "namespace", nc.Namespace)
@@ -431,33 +468,40 @@ func (r *NetworkConfigurationReconciler) handleDeletion(ctx context.Context, nc 
 	return ctrl.Result{}, nil
 }
 
-// getNetworkNamespace fetches the NetworkNamespace by name or via legacy list fallback.
-func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context, namespace, networkNamespaceName string) (*vitistackcrdsv1alpha1.NetworkNamespace, error) {
-	log := logf.FromContext(ctx)
+// getNetworkNamespace fetches the NetworkNamespace by name or via legacy list
+// fallback. Returns:
+//   - nn: the fetched NetworkNamespace.
+//   - fallbackUsed: true if the legacy list-and-pick-first path was taken.
+//   - listCount: when fallbackUsed is true, the number of NNs found in the
+//     namespace; otherwise 0. Callers can use this to decide whether to warn
+//     about ambiguity (multiple NNs in one namespace).
+//   - err: any fetch/list error, or a strict-mode refusal when
+//     STATIC_IP_STRICT_DEFAULTS is enabled and networkNamespaceName is empty.
+//
+// No logs are emitted here so callers can silently triage NCs that belong to
+// another operator and only warn once ownership is confirmed.
+func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context, namespace, networkNamespaceName string) (*vitistackcrdsv1alpha1.NetworkNamespace, bool, int, error) {
 	var nn vitistackcrdsv1alpha1.NetworkNamespace
 
 	if networkNamespaceName != "" {
 		if err := r.Get(ctx, client.ObjectKey{Name: networkNamespaceName, Namespace: namespace}, &nn); err != nil {
-			return nil, fmt.Errorf("failed to get NetworkNamespace %s in namespace %s: %w", networkNamespaceName, namespace, err)
+			return nil, false, 0, fmt.Errorf("failed to get NetworkNamespace %s in namespace %s: %w", networkNamespaceName, namespace, err)
 		}
-	} else {
-		log.Info("WARNING: NetworkConfiguration has no spec.networkNamespaceName set, falling back to listing all NetworkNamespaces in namespace",
-			"namespace", namespace)
-		nnList := &vitistackcrdsv1alpha1.NetworkNamespaceList{}
-		if err := r.List(ctx, nnList, client.InNamespace(namespace)); err != nil {
-			return nil, fmt.Errorf("failed to list NetworkNamespaces in namespace %s: %w", namespace, err)
-		}
-		if len(nnList.Items) == 0 {
-			return nil, fmt.Errorf("no NetworkNamespace found in namespace %s", namespace)
-		}
-		if len(nnList.Items) > 1 {
-			log.Info("WARNING: multiple NetworkNamespaces found in namespace, using first one",
-				"namespace", namespace, "count", len(nnList.Items), "selected", nnList.Items[0].Name)
-		}
-		nn = nnList.Items[0]
+		return &nn, false, 0, nil
 	}
 
-	return &nn, nil
+	if strictDefaultsEnabled() {
+		return nil, true, 0, fmt.Errorf("spec.networkNamespaceName is not set and STATIC_IP_STRICT_DEFAULTS is enabled; refusing to fall back to listing NetworkNamespaces. Set spec.networkNamespaceName explicitly")
+	}
+
+	nnList := &vitistackcrdsv1alpha1.NetworkNamespaceList{}
+	if err := r.List(ctx, nnList, client.InNamespace(namespace)); err != nil {
+		return nil, true, 0, fmt.Errorf("failed to list NetworkNamespaces in namespace %s: %w", namespace, err)
+	}
+	if len(nnList.Items) == 0 {
+		return nil, true, 0, fmt.Errorf("no NetworkNamespace found in namespace %s", namespace)
+	}
+	return &nnList.Items[0], true, len(nnList.Items), nil
 }
 
 // updateNetworkNamespaceIPAllocationStatus updates the IP allocation status counters
