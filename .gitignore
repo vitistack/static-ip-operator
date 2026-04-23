@@ -35,3 +35,4 @@ bin/
 
 # SBOM output
 sbom/
+__debug_bin*

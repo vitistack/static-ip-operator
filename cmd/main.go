@@ -25,7 +25,9 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	"github.com/spf13/viper"
 	"github.com/vitistack/common/pkg/loggers/vlog"
+	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
 	"github.com/vitistack/static-ip-operator/internal/consts"
+	controllerv1alpha1 "github.com/vitistack/static-ip-operator/internal/controller/v1alpha1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +49,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(vitistackcrdsv1alpha1.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -193,6 +196,18 @@ func main() {
 	}
 
 	// +kubebuilder:scaffold:builder
+
+	ncReconciler := controllerv1alpha1.NewNetworkConfigurationReconciler(mgr)
+	if err := ncReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "NetworkConfiguration")
+		os.Exit(1)
+	}
+
+	cpvipReconciler := controllerv1alpha1.NewControlPlaneVirtualSharedIPReconciler(mgr)
+	if err := cpvipReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ControlPlaneVirtualSharedIP")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

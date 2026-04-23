@@ -1,11 +1,53 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: static-ip-operator
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - vitistack.io
+  resources:
+  - controlplanevirtualsharedips
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vitistack.io
+  resources:
+  - controlplanevirtualsharedips/finalizers
+  - networkconfigurations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - vitistack.io
+  resources:
+  - controlplanevirtualsharedips/status
+  - networkconfigurations/status
+  - networknamespaces/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - vitistack.io
+  resources:
+  - networkconfigurations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vitistack.io
+  resources:
+  - networknamespaces
+  verbs:
+  - get
+  - list
+  - watch
