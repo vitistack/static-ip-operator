@@ -7,9 +7,9 @@ metadata:
 spec:
   type: {{ .Values.service.type }}
   ports:
-    - port: {{ .Values.service.port }}
-      targetPort: http
+    - port: 8081
+      targetPort: health
       protocol: TCP
-      name: http
+      name: health
   selector:
     {{- include "static-ip-operator.selectorLabels" . | nindent 4 }}
