@@ -26,6 +26,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/vitistack/common/pkg/loggers/vlog"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
+	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
 	"github.com/vitistack/static-ip-operator/internal/consts"
 	controllerv1alpha1 "github.com/vitistack/static-ip-operator/internal/controller/v1alpha1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -50,6 +51,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(vitistackcrdsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(vitistackcrdsv1alpha2.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -206,6 +208,12 @@ func main() {
 	cpvipReconciler := controllerv1alpha1.NewControlPlaneVirtualSharedIPReconciler(mgr)
 	if err := cpvipReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ControlPlaneVirtualSharedIP")
+		os.Exit(1)
+	}
+
+	ipaReconciler := controllerv1alpha1.NewIPAllocationReconciler(mgr)
+	if err := ipaReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IPAllocation")
 		os.Exit(1)
 	}
 

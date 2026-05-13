@@ -31,6 +31,7 @@ import (
 	viticommonfinalizers "github.com/vitistack/common/pkg/operator/finalizers"
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
+	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
 	"github.com/vitistack/static-ip-operator/internal/consts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -159,6 +160,14 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
+	// Gate on provisioningPhase — wait until the network segment is provisioned
+	if nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
+		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
+			"networkNamespace", nn.Name, "provisioningPhase", nn.Status.ProvisioningPhase,
+			"networkConfiguration", nc.Name, "namespace", req.Namespace)
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+	}
+
 	// Ensure finalizer
 	if !viticommonfinalizers.Has(nc, finalizerName) {
 		if err := viticommonfinalizers.Ensure(ctx, r.Client, nc, finalizerName); err != nil {
@@ -205,39 +214,99 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		"rangeStart", rangeStart.String(), "rangeEnd", rangeEnd.String(),
 		"totalIPs", ipCount(rangeStart, rangeEnd))
 
-	// Allocate IPs for each interface that needs one
-	statusInterfaces, allocCount, errMsgs := r.allocateInterfaces(nc, staticCfg, allocatedIPs, rangeStart, rangeEnd)
-
-	if len(errMsgs) > 0 {
-		errMsg := strings.Join(errMsgs, "; ")
-		log.Error(nil, "IP allocation failed for one or more interfaces",
-			"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace,
-			"errors", errMsg)
-		r.setConditionWithLog(ctx, log, nc, viticommonconditions.New(
-			conditionTypeReady, metav1.ConditionFalse, conditionReasonError, errMsg, nc.GetGeneration(),
-		))
-		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed", errMsg, statusInterfaces)
+	// --- IPAllocation-based flow ---
+	// Ensure an IPAllocation CR exists for each interface in the NC.
+	// The IPAllocationReconciler handles the actual IP assignment.
+	if err := r.ensureIPAllocations(ctx, nc, nn); err != nil {
+		log.Error(err, "failed to ensure IPAllocation resources",
+			"networkConfiguration", nc.Name, "namespace", req.Namespace)
+		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed",
+			fmt.Sprintf("failed to ensure IPAllocation resources: %v", err), nil)
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	// Collect the full list of allocated IP entries (including the ones just allocated)
-	allocatedIPEntries, err := r.collectAllocatedIPEntries(ctx, req.Namespace, nc.Spec.NetworkNamespaceName, "")
-	if err != nil {
-		log.Error(err, "failed to collect allocated IP entries",
-			"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace)
+	// Read back IPAllocations to populate NC status
+	ipaList := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, ipaList, client.InNamespace(req.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name}); err != nil {
+		log.Error(err, "failed to list IPAllocations for NC")
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	// Update NetworkNamespace IP allocation status + network fields (ipv4Prefix, vlanId)
-	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, allocCount, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
-		log.Error(err, "failed to update NetworkNamespace IP allocation status",
-			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
+	// Check if all interfaces have been allocated
+	allAllocated := true
+	ipaByInterface := make(map[string]*vitistackcrdsv1alpha2.IPAllocation)
+	for i := range ipaList.Items {
+		ipa := &ipaList.Items[i]
+		ipaByInterface[ipa.Spec.InterfaceName] = ipa
+		if ipa.Status.Phase != vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			allAllocated = false
+		}
+	}
+
+	if !allAllocated {
+		log.Info("waiting for IPAllocations to be fulfilled",
+			"networkConfiguration", nc.Name, "total", len(nc.Spec.NetworkInterfaces),
+			"allocated", len(ipaByInterface))
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+	}
+
+	// Build status interfaces from IPAllocation status
+	_, ipNet, _ := net.ParseCIDR(staticCfg.IPv4CIDR)
+	var statusInterfaces []vitistackcrdsv1alpha1.NetworkConfigurationInterface
+	allocCount := 0
+
+	for _, iface := range nc.Spec.NetworkInterfaces {
+		statusIface := vitistackcrdsv1alpha1.NetworkConfigurationInterface{
+			Name:       iface.Name,
+			MacAddress: iface.MacAddress,
+			Vlan:       iface.Vlan,
+		}
+
+		if ipa, ok := ipaByInterface[iface.Name]; ok && ipa.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			statusIface.IPv4Addresses = []string{ipa.Status.Address}
+			statusIface.IPv4Subnet = ipNet.String()
+			statusIface.IPv4Gateway = ipa.Status.Gateway
+			statusIface.DNS = ipa.Status.DNS
+			statusIface.IPAllocated = true
+			statusIface.AllocationMethod = vitistackcrdsv1alpha1.IPAllocationTypeStatic
+			if ipa.Status.ExpiresAt != nil {
+				statusIface.AllocationExpiry = ipa.Status.ExpiresAt
+			}
+			allocCount++
+		}
+
+		statusInterfaces = append(statusInterfaces, statusIface)
+	}
+
+	// Also maintain backward-compatible NN status (allocatedIPs from IPAllocation list)
+	allIPAs := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, allIPAs, client.InNamespace(req.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkNamespace: nn.Name}); err != nil {
+		log.Error(err, "failed to list all IPAllocations for NN summary")
+	} else {
+		var allocatedIPEntries []vitistackcrdsv1alpha1.AllocatedIPEntry
+		allocatedCount := 0
+		for i := range allIPAs.Items {
+			a := &allIPAs.Items[i]
+			if a.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+				allocatedCount++
+				allocatedIPEntries = append(allocatedIPEntries, vitistackcrdsv1alpha1.AllocatedIPEntry{
+					IP:                   a.Status.Address,
+					NetworkConfiguration: a.Spec.NetworkConfigurationName,
+				})
+			}
+		}
+		if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, 0, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
+			log.Error(err, "failed to update NetworkNamespace IP allocation status")
+		}
 	}
 
 	totalIPs := ipCount(rangeStart, rangeEnd)
 	totalAllocated := len(allocatedIPs) + allocCount
 	available := totalIPs - totalAllocated
 
-	msg := fmt.Sprintf("All %d interfaces allocated static IPs", allocCount)
+	msg := fmt.Sprintf("All %d interfaces allocated static IPs via IPAllocation CRs", allocCount)
 
 	log.Info("successfully allocated static IPs",
 		"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace,
@@ -468,18 +537,71 @@ func (r *NetworkConfigurationReconciler) handleDeletion(ctx context.Context, nc 
 	return ctrl.Result{}, nil
 }
 
+// ensureIPAllocations creates an IPAllocation CR for each interface in the
+// NetworkConfiguration that doesn't already have one. Each IPAllocation is
+// owned by the NC (via ownerReference) so it's garbage-collected on NC deletion.
+func (r *NetworkConfigurationReconciler) ensureIPAllocations(
+	ctx context.Context,
+	nc *vitistackcrdsv1alpha1.NetworkConfiguration,
+	nn *vitistackcrdsv1alpha1.NetworkNamespace,
+) error {
+	log := logf.FromContext(ctx)
+
+	// List existing IPAllocations for this NC
+	existing := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, existing, client.InNamespace(nc.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name}); err != nil {
+		return fmt.Errorf("listing existing IPAllocations: %w", err)
+	}
+
+	existingByIface := make(map[string]bool)
+	for i := range existing.Items {
+		existingByIface[existing.Items[i].Spec.InterfaceName] = true
+	}
+
+	for _, iface := range nc.Spec.NetworkInterfaces {
+		if existingByIface[iface.Name] {
+			continue
+		}
+
+		ipaName := fmt.Sprintf("%s-%s", nc.Name, iface.Name)
+		ipa := &vitistackcrdsv1alpha2.IPAllocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ipaName,
+				Namespace: nc.Namespace,
+				Labels: map[string]string{
+					vitistackcrdsv1alpha2.LabelNetworkNamespace:    nn.Name,
+					vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: vitistackcrdsv1alpha1.GroupVersion.String(),
+						Kind:       "NetworkConfiguration",
+						Name:       nc.Name,
+						UID:        nc.UID,
+					},
+				},
+			},
+			Spec: vitistackcrdsv1alpha2.IPAllocationSpec{
+				NetworkNamespaceName:     nn.Name,
+				NetworkConfigurationName: nc.Name,
+				InterfaceName:            iface.Name,
+			},
+		}
+
+		if err := r.Create(ctx, ipa); err != nil {
+			return fmt.Errorf("creating IPAllocation %s: %w", ipaName, err)
+		}
+		log.Info("created IPAllocation for interface",
+			"ipAllocation", ipaName, "interface", iface.Name,
+			"networkConfiguration", nc.Name, "networkNamespace", nn.Name)
+	}
+
+	return nil
+}
+
 // getNetworkNamespace fetches the NetworkNamespace by name or via legacy list
-// fallback. Returns:
-//   - nn: the fetched NetworkNamespace.
-//   - fallbackUsed: true if the legacy list-and-pick-first path was taken.
-//   - listCount: when fallbackUsed is true, the number of NNs found in the
-//     namespace; otherwise 0. Callers can use this to decide whether to warn
-//     about ambiguity (multiple NNs in one namespace).
-//   - err: any fetch/list error, or a strict-mode refusal when
-//     STATIC_IP_STRICT_DEFAULTS is enabled and networkNamespaceName is empty.
-//
-// No logs are emitted here so callers can silently triage NCs that belong to
-// another operator and only warn once ownership is confirmed.
+// fallback.
 func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context, namespace, networkNamespaceName string) (*vitistackcrdsv1alpha1.NetworkNamespace, bool, int, error) {
 	var nn vitistackcrdsv1alpha1.NetworkNamespace
 
