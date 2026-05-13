@@ -34,8 +34,7 @@ import (
 )
 
 const (
-	ipaFinalizerName = "vitistack.io/ipallocation-finalizer"
-	ipaRequeueDelay  = 10 * time.Second
+	ipaRequeueDelay = 10 * time.Second
 )
 
 // IPAllocationReconciler reconciles IPAllocation resources. It watches
