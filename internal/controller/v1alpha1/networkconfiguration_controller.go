@@ -570,7 +570,7 @@ func (r *NetworkConfigurationReconciler) ensureIPAllocations(
 				Name:      ipaName,
 				Namespace: nc.Namespace,
 				Labels: map[string]string{
-					vitistackcrdsv1alpha2.LabelNetworkNamespace:    nn.Name,
+					vitistackcrdsv1alpha2.LabelNetworkNamespace:     nn.Name,
 					vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name,
 				},
 				OwnerReferences: []metav1.OwnerReference{
