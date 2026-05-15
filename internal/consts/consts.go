@@ -15,4 +15,8 @@ var (
 	// operator falls back to listing for backward compatibility and logs a
 	// deprecation notice once per resource.
 	STATIC_IP_STRICT_DEFAULTS = "STATIC_IP_STRICT_DEFAULTS"
+
+	// MAX_CONCURRENT_RECONCILES is the maximum number of reconciliations
+	// that run in parallel per controller. Default: 5.
+	MAX_CONCURRENT_RECONCILES = "MAX_CONCURRENT_RECONCILES"
 )

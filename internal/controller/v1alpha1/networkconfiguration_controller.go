@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -49,6 +51,22 @@ var deprecationWarned sync.Map
 func strictDefaultsEnabled() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(consts.STATIC_IP_STRICT_DEFAULTS)))
 	return v == "true" || v == "1" || v == "yes"
+}
+
+// maxConcurrentReconciles returns the configured number of parallel
+// reconciliations per controller, read from MAX_CONCURRENT_RECONCILES.
+// Defaults to 5 when unset or invalid; never returns less than 1.
+func maxConcurrentReconciles() int {
+	const defaultMaxConcurrent = 5
+	v := strings.TrimSpace(os.Getenv(consts.MAX_CONCURRENT_RECONCILES))
+	if v == "" {
+		return defaultMaxConcurrent
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return defaultMaxConcurrent
+	}
+	return n
 }
 
 const (
@@ -95,8 +113,14 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 
 	// Handle deletion before triage: if the NC has our finalizer we must run
-	// cleanup regardless of the NN's current state.
+	// cleanup regardless of the NN's current state. If it doesn't, this NC
+	// isn't ours — return silently so we don't log deletion events for NCs
+	// owned by other operators (kubevirt-operator, etc.) that don't set
+	// spec.provider.
 	if !nc.GetDeletionTimestamp().IsZero() {
+		if !viticommonfinalizers.Has(nc, finalizerName) {
+			return ctrl.Result{}, nil
+		}
 		return r.handleDeletion(ctx, nc, log)
 	}
 
@@ -564,6 +588,7 @@ func NewNetworkConfigurationReconciler(mgr ctrl.Manager) *NetworkConfigurationRe
 func (r *NetworkConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
 		Named("networkconfiguration").
 		Complete(r)
 }
