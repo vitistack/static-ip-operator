@@ -77,8 +77,9 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
 	}
 
-	// Gate on provisioningPhase
-	if nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
+	// Gate on provisioningPhase.
+	// Empty provisioningPhase means the provisioner hasn't set it yet (backward compat) — allow through.
+	if nn.Status.ProvisioningPhase != "" && nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
 		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
 			"networkNamespace", nnName, "provisioningPhase", nn.Status.ProvisioningPhase)
 		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhasePending,

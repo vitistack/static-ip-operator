@@ -160,8 +160,9 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	// Gate on provisioningPhase — wait until the network segment is provisioned
-	if nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
+	// Gate on provisioningPhase — wait until the network segment is provisioned.
+	// Empty provisioningPhase means the provisioner hasn't set it yet (backward compat) — allow through.
+	if nn.Status.ProvisioningPhase != "" && nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
 		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
 			"networkNamespace", nn.Name, "provisioningPhase", nn.Status.ProvisioningPhase,
 			"networkConfiguration", nc.Name, "namespace", req.Namespace)
