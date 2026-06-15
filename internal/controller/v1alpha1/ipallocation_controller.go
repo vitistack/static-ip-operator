@@ -216,7 +216,7 @@ func (r *IPAllocationReconciler) updateNNSummary(
 	existingIPAs *vitistackcrdsv1alpha2.IPAllocationList,
 	currentIPA *vitistackcrdsv1alpha2.IPAllocation,
 ) error {
-	totalCount := int32(ipCountFromIPs(rangeStart, rangeEnd))
+	totalCount := int32(ipCountFromIPs(rangeStart, rangeEnd)) // #nosec G115 -- IP count for a single allocation range; far below int32 max
 	allocatedCount := int32(0)
 	for i := range existingIPAs.Items {
 		if existingIPAs.Items[i].Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
