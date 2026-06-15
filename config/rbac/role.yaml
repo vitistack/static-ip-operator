@@ -18,6 +18,7 @@ rules:
   - vitistack.io
   resources:
   - controlplanevirtualsharedips/finalizers
+  - ipallocations/finalizers
   - networkconfigurations/finalizers
   verbs:
   - update
@@ -25,6 +26,7 @@ rules:
   - vitistack.io
   resources:
   - controlplanevirtualsharedips/status
+  - ipallocations/status
   - networkconfigurations/status
   - networknamespaces/status
   verbs:
@@ -34,6 +36,7 @@ rules:
 - apiGroups:
   - vitistack.io
   resources:
+  - ipallocations
   - networkconfigurations
   verbs:
   - create
