@@ -73,7 +73,7 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.Get(ctx, client.ObjectKey{Name: nnName, Namespace: req.Namespace}, nn); err != nil {
 		log.Error(err, "failed to get NetworkNamespace", "name", nnName)
 		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
-			"", fmt.Sprintf("NetworkNamespace %q not found: %v", nnName, err))
+			fmt.Sprintf("NetworkNamespace %q not found: %v", nnName, err))
 		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
 	}
 
@@ -83,7 +83,7 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
 			"networkNamespace", nnName, "provisioningPhase", nn.Status.ProvisioningPhase)
 		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhasePending,
-			"", fmt.Sprintf("waiting for NetworkNamespace %q provisioning (phase: %s)", nnName, nn.Status.ProvisioningPhase))
+			fmt.Sprintf("waiting for NetworkNamespace %q provisioning (phase: %s)", nnName, nn.Status.ProvisioningPhase))
 		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
 	}
 
@@ -92,7 +92,7 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		log.Error(nil, "NetworkNamespace has no static IP configuration",
 			"networkNamespace", nnName)
 		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
-			"", fmt.Sprintf("NetworkNamespace %q has no static IP configuration", nnName))
+			fmt.Sprintf("NetworkNamespace %q has no static IP configuration", nnName))
 		return ctrl.Result{}, nil
 	}
 
@@ -103,7 +103,7 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		log.Error(err, "invalid static IP range", "networkNamespace", nnName)
 		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
-			"", fmt.Sprintf("invalid IP range: %v", err))
+			fmt.Sprintf("invalid IP range: %v", err))
 		return ctrl.Result{}, nil
 	}
 
@@ -126,42 +126,15 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	// Try to keep existing allocation if still valid
-	var assignedIP string
-	if ipa.Status.Address != "" {
-		ip := net.ParseIP(ipa.Status.Address)
-		if ip != nil && isIPInRange(ip, rangeStart, rangeEnd) {
-			if _, taken := allocated[ipa.Status.Address]; !taken {
-				assignedIP = ipa.Status.Address
-				log.V(1).Info("keeping existing IP allocation", "ip", assignedIP)
-			}
-		}
-	}
-
-	// Honor requested address if set
-	if assignedIP == "" && ipa.Spec.RequestedAddress != "" {
-		reqIP := net.ParseIP(ipa.Spec.RequestedAddress)
-		if reqIP != nil && isIPInRange(reqIP, rangeStart, rangeEnd) {
-			if _, taken := allocated[ipa.Spec.RequestedAddress]; !taken {
-				assignedIP = ipa.Spec.RequestedAddress
-				log.Info("honoring requested address", "ip", assignedIP)
-			} else {
-				log.Info("requested address is already taken", "ip", ipa.Spec.RequestedAddress)
-			}
-		}
-	}
-
-	// Allocate next available
+	// Determine the address to assign: keep the current one when still valid,
+	// otherwise honor a requested address, otherwise allocate the next free IP.
+	assignedIP := selectIP(ctx, ipa, staticCfg, rangeStart, rangeEnd, allocated, nnName)
 	if assignedIP == "" {
-		assignedIP = findNextAvailableIP(rangeStart, rangeEnd, allocated, staticCfg.IPv4Gateway)
-		if assignedIP == "" {
-			log.Error(nil, "no available IPs in range",
-				"networkNamespace", nnName, "allocated", len(allocated))
-			r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
-				"", "no available IP addresses in pool")
-			return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
-		}
-		log.Info("allocated new IP", "ip", assignedIP, "networkNamespace", nnName)
+		log.Error(nil, "no available IPs in range",
+			"networkNamespace", nnName, "allocated", len(allocated))
+		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
+			"no available IP addresses in pool")
+		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
 	}
 
 	// Compute prefix length from CIDR
@@ -257,14 +230,56 @@ func (r *IPAllocationReconciler) updateNNSummary(
 	return r.Status().Patch(ctx, updated, client.MergeFrom(base))
 }
 
-func (r *IPAllocationReconciler) setIPAStatus(ctx context.Context, ipa *vitistackcrdsv1alpha2.IPAllocation, phase vitistackcrdsv1alpha2.IPAllocationPhase, address, message string) {
+func (r *IPAllocationReconciler) setIPAStatus(ctx context.Context, ipa *vitistackcrdsv1alpha2.IPAllocation, phase vitistackcrdsv1alpha2.IPAllocationPhase, message string) {
 	base := ipa.DeepCopy()
 	ipa.Status.Phase = phase
-	if address != "" {
-		ipa.Status.Address = address
-	}
 	ipa.Status.Message = message
 	_ = r.Status().Patch(ctx, ipa, client.MergeFrom(base))
+}
+
+// selectIP chooses an address for the allocation: it keeps the current address
+// when still valid and free, otherwise honors a requested address when free,
+// otherwise allocates the next available address in range. Returns "" when the
+// pool is exhausted.
+func selectIP(
+	ctx context.Context,
+	ipa *vitistackcrdsv1alpha2.IPAllocation,
+	staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig,
+	rangeStart, rangeEnd net.IP,
+	allocated map[string]struct{},
+	nnName string,
+) string {
+	log := logf.FromContext(ctx)
+
+	// Try to keep existing allocation if still valid
+	if ipa.Status.Address != "" {
+		ip := net.ParseIP(ipa.Status.Address)
+		if ip != nil && isIPInRange(ip, rangeStart, rangeEnd) {
+			if _, taken := allocated[ipa.Status.Address]; !taken {
+				log.V(1).Info("keeping existing IP allocation", "ip", ipa.Status.Address)
+				return ipa.Status.Address
+			}
+		}
+	}
+
+	// Honor requested address if set
+	if ipa.Spec.RequestedAddress != "" {
+		reqIP := net.ParseIP(ipa.Spec.RequestedAddress)
+		if reqIP != nil && isIPInRange(reqIP, rangeStart, rangeEnd) {
+			if _, taken := allocated[ipa.Spec.RequestedAddress]; !taken {
+				log.Info("honoring requested address", "ip", ipa.Spec.RequestedAddress)
+				return ipa.Spec.RequestedAddress
+			}
+			log.Info("requested address is already taken", "ip", ipa.Spec.RequestedAddress)
+		}
+	}
+
+	// Allocate next available
+	assignedIP := findNextAvailableIP(rangeStart, rangeEnd, allocated, staticCfg.IPv4Gateway)
+	if assignedIP != "" {
+		log.Info("allocated new IP", "ip", assignedIP, "networkNamespace", nnName)
+	}
+	return assignedIP
 }
 
 // ipCountFromIPs counts IPs between two IP addresses (inclusive).

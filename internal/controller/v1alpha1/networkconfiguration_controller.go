@@ -259,15 +259,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 	}
 
 	// Check if all interfaces have been allocated
-	allAllocated := true
-	ipaByInterface := make(map[string]*vitistackcrdsv1alpha2.IPAllocation)
-	for i := range ipaList.Items {
-		ipa := &ipaList.Items[i]
-		ipaByInterface[ipa.Spec.InterfaceName] = ipa
-		if ipa.Status.Phase != vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
-			allAllocated = false
-		}
-	}
+	ipaByInterface, allAllocated := indexIPAllocations(ipaList)
 
 	if !allAllocated {
 		log.Info("waiting for IPAllocations to be fulfilled",
@@ -278,31 +270,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// Build status interfaces from IPAllocation status
 	_, ipNet, _ := net.ParseCIDR(staticCfg.IPv4CIDR)
-	var statusInterfaces []vitistackcrdsv1alpha1.NetworkConfigurationInterface
-	allocCount := 0
-
-	for _, iface := range nc.Spec.NetworkInterfaces {
-		statusIface := vitistackcrdsv1alpha1.NetworkConfigurationInterface{
-			Name:       iface.Name,
-			MacAddress: iface.MacAddress,
-			Vlan:       iface.Vlan,
-		}
-
-		if ipa, ok := ipaByInterface[iface.Name]; ok && ipa.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
-			statusIface.IPv4Addresses = []string{ipa.Status.Address}
-			statusIface.IPv4Subnet = ipNet.String()
-			statusIface.IPv4Gateway = ipa.Status.Gateway
-			statusIface.DNS = ipa.Status.DNS
-			statusIface.IPAllocated = true
-			statusIface.AllocationMethod = vitistackcrdsv1alpha1.IPAllocationTypeStatic
-			if ipa.Status.ExpiresAt != nil {
-				statusIface.AllocationExpiry = ipa.Status.ExpiresAt
-			}
-			allocCount++
-		}
-
-		statusInterfaces = append(statusInterfaces, statusIface)
-	}
+	statusInterfaces, allocCount := buildStatusInterfaces(nc, ipaByInterface, ipNet)
 
 	// Also maintain backward-compatible NN status (allocatedIPs from IPAllocation list)
 	allIPAs := &vitistackcrdsv1alpha2.IPAllocationList{}
@@ -345,17 +313,68 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 	))
 	r.updateStatusWithLog(ctx, log, nc, "Ready", "Success", msg, statusInterfaces)
 
-	// Requeue before TTL expires to renew allocations
-	requeueAfter := RequeueDelay
-	if staticCfg.TTLSeconds > 0 {
-		ttl := time.Duration(staticCfg.TTLSeconds) * time.Second
-		// Requeue at half the TTL to renew before expiry
-		if half := ttl / 2; half > 0 && half < requeueAfter {
-			requeueAfter = half
+	// Requeue before TTL expires to renew allocations (half the TTL when set).
+	return ctrl.Result{RequeueAfter: ttlRequeue(staticCfg, RequeueDelay)}, nil
+}
+
+// indexIPAllocations maps IPAllocations by interface name and reports whether
+// every one has reached the Allocated phase.
+func indexIPAllocations(ipaList *vitistackcrdsv1alpha2.IPAllocationList) (map[string]*vitistackcrdsv1alpha2.IPAllocation, bool) {
+	byInterface := make(map[string]*vitistackcrdsv1alpha2.IPAllocation)
+	allAllocated := true
+	for i := range ipaList.Items {
+		ipa := &ipaList.Items[i]
+		byInterface[ipa.Spec.InterfaceName] = ipa
+		if ipa.Status.Phase != vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			allAllocated = false
 		}
 	}
+	return byInterface, allAllocated
+}
 
-	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+// buildStatusInterfaces assembles the NetworkConfiguration status interface list
+// from the per-interface IPAllocation results, returning the list and the number
+// of interfaces that received an address.
+func buildStatusInterfaces(
+	nc *vitistackcrdsv1alpha1.NetworkConfiguration,
+	ipaByInterface map[string]*vitistackcrdsv1alpha2.IPAllocation,
+	ipNet *net.IPNet,
+) ([]vitistackcrdsv1alpha1.NetworkConfigurationInterface, int) {
+	statusInterfaces := make([]vitistackcrdsv1alpha1.NetworkConfigurationInterface, 0, len(nc.Spec.NetworkInterfaces))
+	allocCount := 0
+	for _, iface := range nc.Spec.NetworkInterfaces {
+		statusIface := vitistackcrdsv1alpha1.NetworkConfigurationInterface{
+			Name:       iface.Name,
+			MacAddress: iface.MacAddress,
+			Vlan:       iface.Vlan,
+		}
+		if ipa, ok := ipaByInterface[iface.Name]; ok && ipa.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			statusIface.IPv4Addresses = []string{ipa.Status.Address}
+			statusIface.IPv4Subnet = ipNet.String()
+			statusIface.IPv4Gateway = ipa.Status.Gateway
+			statusIface.DNS = ipa.Status.DNS
+			statusIface.IPAllocated = true
+			statusIface.AllocationMethod = vitistackcrdsv1alpha1.IPAllocationTypeStatic
+			if ipa.Status.ExpiresAt != nil {
+				statusIface.AllocationExpiry = ipa.Status.ExpiresAt
+			}
+			allocCount++
+		}
+		statusInterfaces = append(statusInterfaces, statusIface)
+	}
+	return statusInterfaces, allocCount
+}
+
+// ttlRequeue returns the requeue delay, shortened to half the TTL when a TTL is
+// configured so allocations are renewed before they expire.
+func ttlRequeue(staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig, base time.Duration) time.Duration {
+	if staticCfg.TTLSeconds <= 0 {
+		return base
+	}
+	if half := time.Duration(staticCfg.TTLSeconds) * time.Second / 2; half > 0 && half < base {
+		return half
+	}
+	return base
 }
 
 // collectAllocatedIPs lists all NetworkConfigurations in the namespace that reference
