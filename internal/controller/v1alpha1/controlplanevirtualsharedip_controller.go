@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -343,6 +344,7 @@ func (r *ControlPlaneVirtualSharedIPReconciler) SetupWithManager(mgr ctrl.Manage
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIP{}).
 		Owns(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
 		Named("controlplanevirtualsharedip").
 		Complete(r)
 }

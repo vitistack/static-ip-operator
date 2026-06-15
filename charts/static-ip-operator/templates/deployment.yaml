@@ -40,6 +40,10 @@ spec:
           {{- end }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            # Controller concurrency: max objects reconciled in parallel
+            - name: MAX_CONCURRENT_RECONCILES
+              value: {{ .Values.maxConcurrentReconciles | default 5 | quote }}
           ports:
             - name: health
               containerPort: 8081
