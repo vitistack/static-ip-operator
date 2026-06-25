@@ -174,22 +174,28 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
-	staticCfg := nn.Spec.IPAllocation.Static
-	if staticCfg == nil {
-		log.Error(nil, "NetworkNamespace has ipAllocation.type 'static' but missing static configuration block",
-			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace,
-			"required", "ipv4CIDR, ipv4Gateway", "optional", "ipv4RangeStart, ipv4RangeEnd")
-		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed",
-			fmt.Sprintf("NetworkNamespace %s has type 'static' but no static configuration (ipv4CIDR, ipv4Gateway required)", nn.Name), nil)
-		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
-	}
-
 	// Gate on provisioningPhase — wait until the network segment is provisioned.
+	// A NAM-provisioned NetworkNamespace only carries its CIDR/VLAN in status once
+	// it reaches Ready, so we must wait before deriving the pool from status below.
 	// Empty provisioningPhase means the provisioner hasn't set it yet (backward compat) — allow through.
 	if nn.Status.ProvisioningPhase != "" && nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
 		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
 			"networkNamespace", nn.Name, "provisioningPhase", nn.Status.ProvisioningPhase,
 			"networkConfiguration", nc.Name, "namespace", req.Namespace)
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+	}
+
+	// Resolve the static pool. An explicit spec.ipAllocation.static wins, but a
+	// NAM-provisioned NetworkNamespace supplies the pool via status: the CIDR comes
+	// from status.ipv4Prefix, the VLAN from status.vlanId, and the gateway defaults
+	// to the first host of the CIDR (NAM does not return a gateway). This lets a
+	// minimal NAM NetworkNamespace (no static block) be allocated from without the
+	// user restating the dynamically-assigned CIDR.
+	staticCfg, err := effectiveStaticConfig(nn)
+	if err != nil {
+		log.Error(err, "no usable static IP configuration for NetworkNamespace",
+			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
+		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed", err.Error(), nil)
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
@@ -795,6 +801,59 @@ func findNextAvailableIP(rangeStart, rangeEnd net.IP, allocated map[string]struc
 func isIPInRange(ip, rangeStart, rangeEnd net.IP) bool {
 	ipVal := ipToUint32(ip.To4())
 	return ipVal >= ipToUint32(rangeStart) && ipVal <= ipToUint32(rangeEnd)
+}
+
+// effectiveStaticConfig resolves the static IP pool to allocate from. An explicit
+// spec.ipAllocation.static is used as-is for any field the user set; any missing
+// pool field is filled from the NAM-provisioned status: status.ipv4Prefix supplies
+// the CIDR, status.vlanId the VLAN, and the gateway defaults to the first host of
+// the CIDR (NAM does not return a gateway). Returns an error when no CIDR can be
+// determined from either source. The spec is never mutated (cfg is a copy).
+func effectiveStaticConfig(nn *vitistackcrdsv1alpha1.NetworkNamespace) (*vitistackcrdsv1alpha1.StaticIPAllocationConfig, error) {
+	cfg := vitistackcrdsv1alpha1.StaticIPAllocationConfig{}
+	if nn.Spec.IPAllocation != nil && nn.Spec.IPAllocation.Static != nil {
+		cfg = *nn.Spec.IPAllocation.Static
+	}
+
+	if cfg.IPv4CIDR == "" {
+		cfg.IPv4CIDR = strings.TrimSpace(nn.Status.IPv4Prefix)
+	}
+	if cfg.IPv4CIDR == "" {
+		return nil, fmt.Errorf("NetworkNamespace %s has type 'static' but no ipv4CIDR in spec.ipAllocation.static and no provisioned status.ipv4Prefix", nn.Name)
+	}
+
+	if cfg.VlanID == 0 && nn.Status.VlanID != 0 {
+		cfg.VlanID = nn.Status.VlanID
+	}
+
+	if cfg.IPv4Gateway == "" {
+		gw, err := firstHost(cfg.IPv4CIDR)
+		if err != nil {
+			return nil, err
+		}
+		cfg.IPv4Gateway = gw
+	}
+
+	return &cfg, nil
+}
+
+// firstHost returns the first usable host address of a CIDR (network address + 1).
+// It is used as the default gateway when one is not provided (e.g. a NAM-provisioned
+// prefix, which has no associated gateway).
+func firstHost(cidr string) (string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+	}
+	base := ipNet.IP.To4()
+	if base == nil {
+		return "", fmt.Errorf("CIDR %q is not IPv4", cidr)
+	}
+	gw := nextIP(base, 1)
+	if gw == nil {
+		return "", fmt.Errorf("cannot derive gateway from CIDR %q", cidr)
+	}
+	return gw.String(), nil
 }
 
 func ipToUint32(ip net.IP) uint32 {
