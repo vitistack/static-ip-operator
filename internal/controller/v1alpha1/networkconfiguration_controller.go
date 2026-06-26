@@ -751,6 +751,11 @@ func parseIPRange(cfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig) (net.IP, 
 		return nil, nil, fmt.Errorf("invalid IPv4CIDR %q: %w", cfg.IPv4CIDR, err)
 	}
 
+	// The first four addresses of the prefix (network, gateway, and two reserved)
+	// are not allocatable. rangeStart defaults to this floor and may not be set
+	// below it.
+	floor := nextIP(ipNet.IP.To4(), 4)
+
 	var rangeStart, rangeEnd net.IP
 
 	if cfg.IPv4RangeStart != "" {
@@ -758,9 +763,12 @@ func parseIPRange(cfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig) (net.IP, 
 		if rangeStart == nil {
 			return nil, nil, fmt.Errorf("invalid IPv4RangeStart %q", cfg.IPv4RangeStart)
 		}
+		if ipToUint32(rangeStart) < ipToUint32(floor) {
+			return nil, nil, fmt.Errorf("ipv4RangeStart %s is below the minimum allowed start %s for CIDR %s (the first 4 addresses are reserved)", rangeStart, floor, cfg.IPv4CIDR)
+		}
 	} else {
-		// Default: network address + 2 (skip network and gateway)
-		rangeStart = nextIP(ipNet.IP.To4(), 2)
+		// Default: network address + 4 (skip network, gateway, and two reserved)
+		rangeStart = floor
 	}
 
 	if cfg.IPv4RangeEnd != "" {
@@ -832,6 +840,14 @@ func effectiveStaticConfig(nn *vitistackcrdsv1alpha1.NetworkNamespace) (*vitista
 			return nil, err
 		}
 		cfg.IPv4Gateway = gw
+	}
+
+	// NAM provisions a prefix but no DNS. When no DNS is configured anywhere,
+	// default it to the gateway (the common home/simple-network case where the
+	// gateway also serves DNS). A fresh slice is assigned so the spec's DNS slice
+	// is never mutated.
+	if len(cfg.DNS) == 0 {
+		cfg.DNS = []string{cfg.IPv4Gateway}
 	}
 
 	return &cfg, nil
