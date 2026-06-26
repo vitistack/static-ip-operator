@@ -9,6 +9,17 @@ import (
 const (
 	testCIDR = "100.64.9.0/24"
 	altCIDR  = "10.0.1.0/24"
+
+	// Shared host/CIDR fixtures used across the package's controller tests.
+	altFloor      = "10.0.1.4"      // network+4 of altCIDR (default rangeStart floor)
+	altMidHost    = "10.0.1.100"    // arbitrary mid host of altCIDR
+	altLastUsable = "10.0.1.254"    // last usable host of altCIDR (also reused as a gateway fixture)
+	testFirstHost = "100.64.9.1"    // first host / derived gateway of testCIDR
+	testHighHost  = "100.64.9.254"  // high host of testCIDR
+	cidr25High    = "10.0.1.128/25" // upper /25 of the 10.0.1.x block
+	cidr25Floor   = "10.0.1.132"    // network+4 of cidr25High
+	cidr26Off     = "192.168.5.64/26"
+	netPlus4      = "10.0.0.4" // network+4 of any 10.0.0.0-based prefix
 )
 
 func TestFirstHost(t *testing.T) {
@@ -16,7 +27,7 @@ func TestFirstHost(t *testing.T) {
 		cidr string
 		want string
 	}{
-		{testCIDR, "100.64.9.1"},
+		{testCIDR, testFirstHost},
 		{altCIDR, "10.0.1.1"},
 		{"192.168.5.0/26", "192.168.5.1"},
 	}
@@ -62,7 +73,7 @@ func TestEffectiveStaticConfig_FallsBackToNamStatus(t *testing.T) {
 	if cfg.IPv4CIDR != testCIDR {
 		t.Errorf("IPv4CIDR = %q, want 100.64.9.0/24 (from status.ipv4Prefix)", cfg.IPv4CIDR)
 	}
-	if cfg.IPv4Gateway != "100.64.9.1" {
+	if cfg.IPv4Gateway != testFirstHost {
 		t.Errorf("IPv4Gateway = %q, want 100.64.9.1 (first host)", cfg.IPv4Gateway)
 	}
 	if cfg.VlanID != 2123 {
@@ -74,7 +85,7 @@ func TestEffectiveStaticConfig_SpecWins(t *testing.T) {
 	// Explicit spec.static overrides everything; status is ignored.
 	nn := nnWith(&vitistackcrdsv1alpha1.StaticIPAllocationConfig{
 		IPv4CIDR:    altCIDR,
-		IPv4Gateway: "10.0.1.254",
+		IPv4Gateway: altLastUsable,
 		VlanID:      77,
 	}, testCIDR, 2123)
 
@@ -82,7 +93,7 @@ func TestEffectiveStaticConfig_SpecWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.IPv4CIDR != altCIDR || cfg.IPv4Gateway != "10.0.1.254" || cfg.VlanID != 77 {
+	if cfg.IPv4CIDR != altCIDR || cfg.IPv4Gateway != altLastUsable || cfg.VlanID != 77 {
 		t.Errorf("spec values should win, got cidr=%q gw=%q vlan=%d", cfg.IPv4CIDR, cfg.IPv4Gateway, cfg.VlanID)
 	}
 }
@@ -90,7 +101,7 @@ func TestEffectiveStaticConfig_SpecWins(t *testing.T) {
 func TestEffectiveStaticConfig_PartialSpecFillsGapsFromStatus(t *testing.T) {
 	// Spec sets the gateway but not the CIDR; CIDR comes from status, gateway kept.
 	nn := nnWith(&vitistackcrdsv1alpha1.StaticIPAllocationConfig{
-		IPv4Gateway: "100.64.9.254",
+		IPv4Gateway: testHighHost,
 	}, testCIDR, 2123)
 
 	cfg, err := effectiveStaticConfig(nn)
@@ -100,8 +111,37 @@ func TestEffectiveStaticConfig_PartialSpecFillsGapsFromStatus(t *testing.T) {
 	if cfg.IPv4CIDR != testCIDR {
 		t.Errorf("IPv4CIDR = %q, want 100.64.9.0/24 (from status)", cfg.IPv4CIDR)
 	}
-	if cfg.IPv4Gateway != "100.64.9.254" {
-		t.Errorf("IPv4Gateway = %q, want 100.64.9.254 (kept from spec)", cfg.IPv4Gateway)
+	if cfg.IPv4Gateway != testHighHost {
+		t.Errorf("IPv4Gateway = %q, want %s (kept from spec)", cfg.IPv4Gateway, testHighHost)
+	}
+}
+
+func TestEffectiveStaticConfig_DefaultsDNSToGateway(t *testing.T) {
+	// NAM-provisioned NN with no spec.static block and no DNS anywhere:
+	// DNS should default to the derived gateway (first host of the CIDR).
+	nn := nnWith(nil, testCIDR, 2123)
+
+	cfg, err := effectiveStaticConfig(nn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.DNS) != 1 || cfg.DNS[0] != testFirstHost {
+		t.Errorf("DNS = %v, want [100.64.9.1] (defaulted to derived gateway)", cfg.DNS)
+	}
+}
+
+func TestEffectiveStaticConfig_KeepsExplicitDNS(t *testing.T) {
+	// An explicit spec.static.dns must be preserved, not overwritten by the gateway default.
+	nn := nnWith(&vitistackcrdsv1alpha1.StaticIPAllocationConfig{
+		DNS: []string{"8.8.8.8", "1.1.1.1"},
+	}, testCIDR, 2123)
+
+	cfg, err := effectiveStaticConfig(nn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.DNS) != 2 || cfg.DNS[0] != "8.8.8.8" || cfg.DNS[1] != "1.1.1.1" {
+		t.Errorf("DNS = %v, want [8.8.8.8 1.1.1.1] (kept from spec)", cfg.DNS)
 	}
 }
 

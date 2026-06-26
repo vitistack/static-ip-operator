@@ -87,16 +87,18 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
 	}
 
-	// Validate static IP config exists
-	if nn.Spec.IPAllocation == nil || nn.Spec.IPAllocation.Static == nil {
-		log.Error(nil, "NetworkNamespace has no static IP configuration",
+	// Resolve the static pool config. An explicit spec.ipAllocation.static is used
+	// as-is; otherwise the pool is derived from the NAM-provisioned status.ipv4Prefix
+	// (gateway = first host, DNS = gateway, range = network+4..broadcast-1). This is
+	// the same resolver the NetworkConfiguration controller uses, so both the
+	// hand-written ("manual") and NAM-provisioned static modes behave identically.
+	staticCfg, err := effectiveStaticConfig(nn)
+	if err != nil {
+		log.Error(err, "NetworkNamespace has no usable static IP configuration",
 			"networkNamespace", nnName)
-		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError,
-			fmt.Sprintf("NetworkNamespace %q has no static IP configuration", nnName))
+		r.setIPAStatus(ctx, ipa, vitistackcrdsv1alpha2.IPAllocationPhaseError, err.Error())
 		return ctrl.Result{}, nil
 	}
-
-	staticCfg := nn.Spec.IPAllocation.Static
 
 	// Parse IP range
 	rangeStart, rangeEnd, err := parseIPRange(staticCfg)
