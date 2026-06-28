@@ -28,7 +28,7 @@ func newCPVIPReconciler(t *testing.T, objs ...client.Object) *ControlPlaneVirtua
 
 func cpvipWithProvider(provider string) *vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIP {
 	return &vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIP{
-		ObjectMeta: metav1.ObjectMeta{Name: "t-test-cpvip", Namespace: "test001"},
+		ObjectMeta: metav1.ObjectMeta{Name: "t-test-cpvip", Namespace: testNamespace},
 		Spec: vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIPSpec{
 			Provider:                   provider,
 			NetworkNamespaceIdentifier: "test-nn",
@@ -36,7 +36,7 @@ func cpvipWithProvider(provider string) *vitistackcrdsv1alpha1.ControlPlaneVirtu
 	}
 }
 
-var cpvipReq = ctrl.Request{NamespacedName: types.NamespacedName{Name: "t-test-cpvip", Namespace: "test001"}}
+var cpvipReq = ctrl.Request{NamespacedName: types.NamespacedName{Name: "t-test-cpvip", Namespace: testNamespace}}
 
 // Ownership is gated on CPVSharedIP.spec.provider (set by the talos-operator's
 // LOADBALANCER_PROVIDER), not the NetworkNamespace's ipAllocation.provider.

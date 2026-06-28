@@ -27,6 +27,7 @@ import (
 	viticommonfinalizers "github.com/vitistack/common/pkg/operator/finalizers"
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
+	"github.com/vitistack/static-ip-operator/internal/settings"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -340,7 +341,7 @@ func (r *ControlPlaneVirtualSharedIPReconciler) SetupWithManager(mgr ctrl.Manage
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIP{}).
 		Owns(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: settings.MaxConcurrentReconciles()}).
 		Named("controlplanevirtualsharedip").
 		Complete(r)
 }
