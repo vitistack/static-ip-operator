@@ -26,6 +26,7 @@ import (
 	viticommonconditions "github.com/vitistack/common/pkg/operator/conditions"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
 	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -228,6 +229,13 @@ func (r *IPAllocationReconciler) updateNNSummary(
 	updated.Status.IPAllocationStatus.AllocatedCount = allocatedCount
 	updated.Status.IPAllocationStatus.AvailableCount = totalCount - allocatedCount
 	// No more AllocatedIPs array — that data lives in IPAllocation CRs now
+
+	// Skip the write when the summary already matches; allocation and TTL-renewal
+	// reconciles routinely recompute the same counts, and an unconditional patch
+	// would churn the NetworkNamespace status for no reason.
+	if apiequality.Semantic.DeepEqual(base.Status, updated.Status) {
+		return nil
+	}
 
 	return r.Status().Patch(ctx, updated, client.MergeFrom(base))
 }

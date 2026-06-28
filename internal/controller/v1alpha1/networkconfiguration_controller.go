@@ -17,12 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,7 +33,8 @@ import (
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
 	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
-	"github.com/vitistack/static-ip-operator/internal/consts"
+	"github.com/vitistack/static-ip-operator/internal/settings"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,30 +46,6 @@ import (
 // deprecationWarned tracks resources for which a deprecation notice has already
 // been logged, so we don't spam the logs on every reconcile loop.
 var deprecationWarned sync.Map
-
-// strictDefaultsEnabled reports whether STATIC_IP_STRICT_DEFAULTS is set to a
-// truthy value. When true, the operator refuses to treat unset fields as
-// defaults and instead surfaces an error — forcing migration to explicit config.
-func strictDefaultsEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(consts.STATIC_IP_STRICT_DEFAULTS)))
-	return v == "true" || v == "1" || v == "yes"
-}
-
-// maxConcurrentReconciles returns the configured number of parallel
-// reconciliations per controller, read from MAX_CONCURRENT_RECONCILES.
-// Defaults to 5 when unset or invalid; never returns less than 1.
-func maxConcurrentReconciles() int {
-	const defaultMaxConcurrent = 5
-	v := strings.TrimSpace(os.Getenv(consts.MAX_CONCURRENT_RECONCILES))
-	if v == "" {
-		return defaultMaxConcurrent
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return defaultMaxConcurrent
-	}
-	return n
-}
 
 const (
 	finalizerName              = "vitistack.io/static-ip-finalizer"
@@ -152,10 +129,10 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- Past triage: this NC is ours (type=static). ---
 
-	log.Info("reconciling NetworkConfiguration",
+	log.V(1).Info("reconciling NetworkConfiguration",
 		"name", nc.Name, "namespace", req.Namespace, "generation", nc.GetGeneration())
 
-	log.Info("found NetworkNamespace",
+	log.V(1).Info("found NetworkNamespace",
 		"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
 
 	// Warn (once) about the fallback NN lookup when we're actually handling
@@ -227,7 +204,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	log.Info("collected existing IP allocations",
+	log.V(1).Info("collected existing IP allocations",
 		"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "allocatedCount", len(allocatedIPs))
 
 	// Parse the IP range
@@ -240,7 +217,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	log.Info("parsed IP range",
+	log.V(1).Info("parsed IP range",
 		"networkNamespace", nn.Name, "cidr", staticCfg.IPv4CIDR,
 		"rangeStart", rangeStart.String(), "rangeEnd", rangeEnd.String(),
 		"totalIPs", ipCount(rangeStart, rangeEnd))
@@ -296,7 +273,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 				})
 			}
 		}
-		if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, 0, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
+		if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
 			log.Error(err, "failed to update NetworkNamespace IP allocation status")
 		}
 	}
@@ -307,7 +284,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 
 	msg := fmt.Sprintf("All %d interfaces allocated static IPs via IPAllocation CRs", allocCount)
 
-	log.Info("successfully allocated static IPs",
+	log.V(1).Info("successfully allocated static IPs",
 		"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace,
 		"interfacesAllocated", allocCount, "totalAllocated", totalAllocated,
 		"totalIPs", totalIPs, "availableIPs", available)
@@ -319,8 +296,12 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 	))
 	r.updateStatusWithLog(ctx, log, nc, "Ready", "Success", msg, statusInterfaces)
 
-	// Requeue before TTL expires to renew allocations (half the TTL when set).
-	return ctrl.Result{RequeueAfter: ttlRequeue(staticCfg, RequeueDelay)}, nil
+	// No time-based requeue on success. The lease lifecycle (including TTL renewal)
+	// is owned by the IPAllocationReconciler; this controller only reflects the
+	// IPAllocation status. We re-reconcile on IPAllocation changes via the Owns()
+	// watch and on spec changes via the For() watch, so polling here would only
+	// re-list, re-patch, and re-log with nothing to do (steady-state churn).
+	return ctrl.Result{}, nil
 }
 
 // indexIPAllocations maps IPAllocations by interface name and reports whether
@@ -369,18 +350,6 @@ func buildStatusInterfaces(
 		statusInterfaces = append(statusInterfaces, statusIface)
 	}
 	return statusInterfaces, allocCount
-}
-
-// ttlRequeue returns the requeue delay, shortened to half the TTL when a TTL is
-// configured so allocations are renewed before they expire.
-func ttlRequeue(staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig, base time.Duration) time.Duration {
-	if staticCfg.TTLSeconds <= 0 {
-		return base
-	}
-	if half := time.Duration(staticCfg.TTLSeconds) * time.Second / 2; half > 0 && half < base {
-		return half
-	}
-	return base
 }
 
 // collectAllocatedIPs lists all NetworkConfigurations in the namespace that reference
@@ -471,21 +440,16 @@ func (r *NetworkConfigurationReconciler) handleDeletion(ctx context.Context, nc 
 		return ctrl.Result{}, nil
 	}
 
-	// Collect remaining allocations (the deleted NC is excluded because its finalizer is gone)
-	allocatedIPs, err := r.collectAllocatedIPs(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName, nc.Name)
-	if err != nil {
-		log.Error(err, "failed to collect allocated IPs during deletion cleanup")
-		return ctrl.Result{}, nil
-	}
-
-	// Also collect the ownership map for the status
+	// Collect the remaining allocations (the deleted NC is excluded because its
+	// finalizer is gone). This list is the single source of truth for both the
+	// count and the ownership entries written to the NetworkNamespace status.
 	allocatedIPEntries, err := r.collectAllocatedIPEntries(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName, nc.Name)
 	if err != nil {
 		log.Error(err, "failed to collect allocated IP entries during deletion cleanup")
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, 0, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
+	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
 		log.Error(err, "failed to update NetworkNamespace IP allocation status during deletion cleanup")
 	}
 
@@ -567,7 +531,7 @@ func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context
 		return &nn, false, 0, nil
 	}
 
-	if strictDefaultsEnabled() {
+	if settings.StrictDefaults() {
 		return nil, true, 0, fmt.Errorf("spec.networkNamespaceName is not set and STATIC_IP_STRICT_DEFAULTS is enabled; refusing to fall back to listing NetworkNamespaces. Set spec.networkNamespaceName explicitly")
 	}
 
@@ -588,15 +552,22 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 	ctx context.Context,
 	nn *vitistackcrdsv1alpha1.NetworkNamespace,
 	staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig,
-	allocatedIPs map[string]struct{},
-	newAllocations int,
 	rangeStart, rangeEnd net.IP,
 	allocatedIPEntries []vitistackcrdsv1alpha1.AllocatedIPEntry,
 ) error {
 	log := logf.FromContext(ctx)
 
-	totalCount := int32(ipCount(rangeStart, rangeEnd))                 // #nosec G115 -- max 253 for /24, well within int32
-	allocatedCount := int32(len(allocatedIPs)) + int32(newAllocations) // #nosec G115 -- bounded by totalCount
+	// allocatedIPEntries is the authoritative set of allocated IPs in this
+	// NetworkNamespace, so the count and the list are derived from a single
+	// source and can never disagree. Deriving the count from a self-excluding
+	// set previously undercounted by the reconciling NC's own allocations.
+	totalCount := int32(ipCount(rangeStart, rangeEnd)) // #nosec G115 -- max 253 for /24, well within int32
+	allocatedCount := int32(len(allocatedIPEntries))   // #nosec G115 -- bounded by totalCount
+
+	// Sort entries by IP so the persisted list is deterministic. The cache List
+	// that produces these entries returns map-iteration order, so without this
+	// the list would reorder between reconciles and defeat the no-op guard below.
+	sortAllocatedIPEntries(allocatedIPEntries)
 
 	base := nn.DeepCopy()
 	updated := nn.DeepCopy()
@@ -617,6 +588,16 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 	updated.Status.IPAllocationStatus.AvailableCount = totalCount - allocatedCount
 	updated.Status.IPAllocationStatus.AllocatedIPs = allocatedIPEntries
 
+	// Skip the write (and the misleading "updated" log) when nothing changed.
+	// Reconcile is level-triggered and fires for every object on cache sync, so
+	// most reconciles are no-ops; patching unconditionally churns the apiserver
+	// and emits a status event that needlessly re-triggers reconciles.
+	if apiequality.Semantic.DeepEqual(base.Status, updated.Status) {
+		log.V(1).Info("NetworkNamespace IP allocation status already up to date",
+			"networkNamespace", nn.Name, "namespace", nn.Namespace)
+		return nil
+	}
+
 	if err := r.Status().Patch(ctx, updated, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("failed to patch NetworkNamespace %s/%s status: %w", nn.Namespace, nn.Name, err)
 	}
@@ -627,6 +608,20 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 		"totalIPs", totalCount, "allocated", allocatedCount, "available", totalCount-allocatedCount)
 
 	return nil
+}
+
+// sortAllocatedIPEntries orders entries by IP address so the persisted list is
+// stable across reconciles regardless of the (map-iteration) order the cache
+// returns. A stable order is what lets the DeepEqual no-op guard skip redundant
+// status writes.
+func sortAllocatedIPEntries(entries []vitistackcrdsv1alpha1.AllocatedIPEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := net.ParseIP(entries[i].IP), net.ParseIP(entries[j].IP)
+		if a != nil && b != nil {
+			return bytes.Compare(a, b) < 0
+		}
+		return entries[i].IP < entries[j].IP
+	})
 }
 
 // NewNetworkConfigurationReconciler creates a new reconciler.
@@ -641,7 +636,11 @@ func NewNetworkConfigurationReconciler(mgr ctrl.Manager) *NetworkConfigurationRe
 func (r *NetworkConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
+		// IPAllocations are created with an ownerReference to the NC, so this
+		// watch re-reconciles the NC when its allocations change phase (e.g.
+		// Pending->Allocated, TTL renewal) — replacing the old 10s poll.
+		Owns(&vitistackcrdsv1alpha2.IPAllocation{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: settings.MaxConcurrentReconciles()}).
 		Named("networkconfiguration").
 		Complete(r)
 }
@@ -686,6 +685,11 @@ func (r *NetworkConfigurationReconciler) updateStatus(
 	}
 	if networkInterfaces != nil {
 		updated.Status.NetworkInterfaces = networkInterfaces
+	}
+
+	// Skip redundant writes on no-op reconciles (mirrors setCondition).
+	if apiequality.Semantic.DeepEqual(base.Status, updated.Status) {
+		return nil
 	}
 
 	if err := r.Status().Patch(ctx, updated, client.MergeFrom(base)); err != nil {
