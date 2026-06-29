@@ -90,8 +90,7 @@ jobs:
         uses: azure/setup-helm@v5.0.0
         with:
           version: 'latest'
-          token: ${{ secrets.GITHUB_TOKEN }}
-
+          
       - name: Extract version
         id: version
         run: |
@@ -160,7 +159,6 @@ jobs:
         uses: azure/setup-helm@v5.0.0
         with:
           version: 'latest'
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta

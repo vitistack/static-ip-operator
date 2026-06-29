@@ -23,11 +23,11 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
-	"github.com/spf13/viper"
 	"github.com/vitistack/common/pkg/loggers/vlog"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
-	"github.com/vitistack/static-ip-operator/internal/consts"
+	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
 	controllerv1alpha1 "github.com/vitistack/static-ip-operator/internal/controller/v1alpha1"
+	"github.com/vitistack/static-ip-operator/internal/settings"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -50,6 +50,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(vitistackcrdsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(vitistackcrdsv1alpha2.AddToScheme(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -87,14 +88,15 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	// Set up the logger
+	// Set up the logger from centralized settings (env + defaults live in
+	// internal/settings, which owns the viper instance).
 	vlogSetup := vlog.Options{
-		Level:             viper.GetString(consts.LOG_LEVEL),
-		ColorizeLine:      viper.GetBool(consts.LOG_COLORIZE_LINE),
-		AddCaller:         viper.GetBool(consts.LOG_ADD_CALLER),
-		DisableStacktrace: viper.GetBool(consts.LOG_DISABLE_STACKTRACE),
-		UnescapeMultiline: viper.GetBool(consts.LOG_UNESCAPED_MULTILINE),
-		JSON:              viper.GetBool(consts.LOG_JSON),
+		Level:             settings.LogLevel(),
+		ColorizeLine:      settings.LogColorizeLine(),
+		AddCaller:         settings.LogAddCaller(),
+		DisableStacktrace: settings.LogDisableStacktrace(),
+		UnescapeMultiline: settings.LogUnescapeMultiline(),
+		JSON:              settings.LogJSON(),
 	}
 	_ = vlog.Setup(vlogSetup)
 	defer func() {
@@ -206,6 +208,12 @@ func main() {
 	cpvipReconciler := controllerv1alpha1.NewControlPlaneVirtualSharedIPReconciler(mgr)
 	if err := cpvipReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ControlPlaneVirtualSharedIP")
+		os.Exit(1)
+	}
+
+	ipaReconciler := controllerv1alpha1.NewIPAllocationReconciler(mgr)
+	if err := ipaReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "IPAllocation")
 		os.Exit(1)
 	}
 
