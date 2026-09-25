@@ -17,12 +17,12 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +32,9 @@ import (
 	viticommonfinalizers "github.com/vitistack/common/pkg/operator/finalizers"
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
-	"github.com/vitistack/static-ip-operator/internal/consts"
+	vitistackcrdsv1alpha2 "github.com/vitistack/common/pkg/v1alpha2"
+	"github.com/vitistack/static-ip-operator/internal/settings"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -44,30 +46,6 @@ import (
 // deprecationWarned tracks resources for which a deprecation notice has already
 // been logged, so we don't spam the logs on every reconcile loop.
 var deprecationWarned sync.Map
-
-// strictDefaultsEnabled reports whether STATIC_IP_STRICT_DEFAULTS is set to a
-// truthy value. When true, the operator refuses to treat unset fields as
-// defaults and instead surfaces an error — forcing migration to explicit config.
-func strictDefaultsEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(consts.STATIC_IP_STRICT_DEFAULTS)))
-	return v == "true" || v == "1" || v == "yes"
-}
-
-// maxConcurrentReconciles returns the configured number of parallel
-// reconciliations per controller, read from MAX_CONCURRENT_RECONCILES.
-// Defaults to 5 when unset or invalid; never returns less than 1.
-func maxConcurrentReconciles() int {
-	const defaultMaxConcurrent = 5
-	v := strings.TrimSpace(os.Getenv(consts.MAX_CONCURRENT_RECONCILES))
-	if v == "" {
-		return defaultMaxConcurrent
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return defaultMaxConcurrent
-	}
-	return n
-}
 
 const (
 	finalizerName              = "vitistack.io/static-ip-finalizer"
@@ -151,10 +129,10 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 
 	// --- Past triage: this NC is ours (type=static). ---
 
-	log.Info("reconciling NetworkConfiguration",
+	log.V(1).Info("reconciling NetworkConfiguration",
 		"name", nc.Name, "namespace", req.Namespace, "generation", nc.GetGeneration())
 
-	log.Info("found NetworkNamespace",
+	log.V(1).Info("found NetworkNamespace",
 		"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
 
 	// Warn (once) about the fallback NN lookup when we're actually handling
@@ -173,13 +151,28 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
-	staticCfg := nn.Spec.IPAllocation.Static
-	if staticCfg == nil {
-		log.Error(nil, "NetworkNamespace has ipAllocation.type 'static' but missing static configuration block",
-			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace,
-			"required", "ipv4CIDR, ipv4Gateway", "optional", "ipv4RangeStart, ipv4RangeEnd")
-		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed",
-			fmt.Sprintf("NetworkNamespace %s has type 'static' but no static configuration (ipv4CIDR, ipv4Gateway required)", nn.Name), nil)
+	// Gate on provisioningPhase — wait until the network segment is provisioned.
+	// A NAM-provisioned NetworkNamespace only carries its CIDR/VLAN in status once
+	// it reaches Ready, so we must wait before deriving the pool from status below.
+	// Empty provisioningPhase means the provisioner hasn't set it yet (backward compat) — allow through.
+	if nn.Status.ProvisioningPhase != "" && nn.Status.ProvisioningPhase != string(vitistackcrdsv1alpha2.ProvisioningPhaseReady) {
+		log.V(1).Info("NetworkNamespace not yet provisioned, waiting",
+			"networkNamespace", nn.Name, "provisioningPhase", nn.Status.ProvisioningPhase,
+			"networkConfiguration", nc.Name, "namespace", req.Namespace)
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+	}
+
+	// Resolve the static pool. An explicit spec.ipAllocation.static wins, but a
+	// NAM-provisioned NetworkNamespace supplies the pool via status: the CIDR comes
+	// from status.ipv4Prefix, the VLAN from status.vlanId, and the gateway defaults
+	// to the first host of the CIDR (NAM does not return a gateway). This lets a
+	// minimal NAM NetworkNamespace (no static block) be allocated from without the
+	// user restating the dynamically-assigned CIDR.
+	staticCfg, err := effectiveStaticConfig(nn)
+	if err != nil {
+		log.Error(err, "no usable static IP configuration for NetworkNamespace",
+			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
+		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed", err.Error(), nil)
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
@@ -211,7 +204,7 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	log.Info("collected existing IP allocations",
+	log.V(1).Info("collected existing IP allocations",
 		"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "allocatedCount", len(allocatedIPs))
 
 	// Parse the IP range
@@ -224,46 +217,74 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	log.Info("parsed IP range",
+	log.V(1).Info("parsed IP range",
 		"networkNamespace", nn.Name, "cidr", staticCfg.IPv4CIDR,
 		"rangeStart", rangeStart.String(), "rangeEnd", rangeEnd.String(),
 		"totalIPs", ipCount(rangeStart, rangeEnd))
 
-	// Allocate IPs for each interface that needs one
-	statusInterfaces, allocCount, errMsgs := r.allocateInterfaces(nc, staticCfg, allocatedIPs, rangeStart, rangeEnd)
-
-	if len(errMsgs) > 0 {
-		errMsg := strings.Join(errMsgs, "; ")
-		log.Error(nil, "IP allocation failed for one or more interfaces",
-			"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace,
-			"errors", errMsg)
-		r.setConditionWithLog(ctx, log, nc, viticommonconditions.New(
-			conditionTypeReady, metav1.ConditionFalse, conditionReasonError, errMsg, nc.GetGeneration(),
-		))
-		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed", errMsg, statusInterfaces)
+	// --- IPAllocation-based flow ---
+	// Ensure an IPAllocation CR exists for each interface in the NC.
+	// The IPAllocationReconciler handles the actual IP assignment.
+	if err := r.ensureIPAllocations(ctx, nc, nn); err != nil {
+		log.Error(err, "failed to ensure IPAllocation resources",
+			"networkConfiguration", nc.Name, "namespace", req.Namespace)
+		r.updateStatusWithLog(ctx, log, nc, "Error", "Failed",
+			fmt.Sprintf("failed to ensure IPAllocation resources: %v", err), nil)
 		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	// Collect the full list of allocated IP entries (including the ones just allocated)
-	allocatedIPEntries, err := r.collectAllocatedIPEntries(ctx, req.Namespace, nc.Spec.NetworkNamespaceName, "")
-	if err != nil {
-		log.Error(err, "failed to collect allocated IP entries",
-			"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace)
+	// Read back IPAllocations to populate NC status
+	ipaList := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, ipaList, client.InNamespace(req.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name}); err != nil {
+		log.Error(err, "failed to list IPAllocations for NC")
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
 	}
 
-	// Update NetworkNamespace IP allocation status + network fields (ipv4Prefix, vlanId)
-	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, allocCount, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
-		log.Error(err, "failed to update NetworkNamespace IP allocation status",
-			"networkNamespace", nn.Name, "networkConfiguration", nc.Name, "namespace", req.Namespace)
+	// Check if all interfaces have been allocated
+	ipaByInterface, allAllocated := indexIPAllocations(ipaList)
+
+	if !allAllocated {
+		log.Info("waiting for IPAllocations to be fulfilled",
+			"networkConfiguration", nc.Name, "total", len(nc.Spec.NetworkInterfaces),
+			"allocated", len(ipaByInterface))
+		return ctrl.Result{RequeueAfter: RequeueDelay}, nil
+	}
+
+	// Build status interfaces from IPAllocation status
+	_, ipNet, _ := net.ParseCIDR(staticCfg.IPv4CIDR)
+	statusInterfaces, allocCount := buildStatusInterfaces(nc, ipaByInterface, ipNet)
+
+	// Also maintain backward-compatible NN status (allocatedIPs from IPAllocation list)
+	allIPAs := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, allIPAs, client.InNamespace(req.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkNamespace: nn.Name}); err != nil {
+		log.Error(err, "failed to list all IPAllocations for NN summary")
+	} else {
+		var allocatedIPEntries []vitistackcrdsv1alpha1.AllocatedIPEntry
+		allocatedCount := 0
+		for i := range allIPAs.Items {
+			a := &allIPAs.Items[i]
+			if a.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+				allocatedCount++
+				allocatedIPEntries = append(allocatedIPEntries, vitistackcrdsv1alpha1.AllocatedIPEntry{
+					IP:                   a.Status.Address,
+					NetworkConfiguration: a.Spec.NetworkConfigurationName,
+				})
+			}
+		}
+		if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
+			log.Error(err, "failed to update NetworkNamespace IP allocation status")
+		}
 	}
 
 	totalIPs := ipCount(rangeStart, rangeEnd)
 	totalAllocated := len(allocatedIPs) + allocCount
 	available := totalIPs - totalAllocated
 
-	msg := fmt.Sprintf("All %d interfaces allocated static IPs", allocCount)
+	msg := fmt.Sprintf("All %d interfaces allocated static IPs via IPAllocation CRs", allocCount)
 
-	log.Info("successfully allocated static IPs",
+	log.V(1).Info("successfully allocated static IPs",
 		"networkConfiguration", nc.Name, "networkNamespace", nn.Name, "namespace", req.Namespace,
 		"interfacesAllocated", allocCount, "totalAllocated", totalAllocated,
 		"totalIPs", totalIPs, "availableIPs", available)
@@ -275,112 +296,60 @@ func (r *NetworkConfigurationReconciler) Reconcile(ctx context.Context, req ctrl
 	))
 	r.updateStatusWithLog(ctx, log, nc, "Ready", "Success", msg, statusInterfaces)
 
-	// Requeue before TTL expires to renew allocations
-	requeueAfter := RequeueDelay
-	if staticCfg.TTLSeconds > 0 {
-		ttl := time.Duration(staticCfg.TTLSeconds) * time.Second
-		// Requeue at half the TTL to renew before expiry
-		if half := ttl / 2; half > 0 && half < requeueAfter {
-			requeueAfter = half
-		}
-	}
-
-	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	// No time-based requeue on success. The lease lifecycle (including TTL renewal)
+	// is owned by the IPAllocationReconciler; this controller only reflects the
+	// IPAllocation status. We re-reconcile on IPAllocation changes via the Owns()
+	// watch and on spec changes via the For() watch, so polling here would only
+	// re-list, re-patch, and re-log with nothing to do (steady-state churn).
+	return ctrl.Result{}, nil
 }
 
-// allocateInterfaces assigns a static IP to each interface on the NetworkConfiguration.
-// It tries to keep existing allocations stable (if the interface already has a valid
-// static IP within range, it keeps it).
-func (r *NetworkConfigurationReconciler) allocateInterfaces(
-	nc *vitistackcrdsv1alpha1.NetworkConfiguration,
-	staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig,
-	allocatedIPs map[string]struct{},
-	rangeStart, rangeEnd net.IP,
-) ([]vitistackcrdsv1alpha1.NetworkConfigurationInterface, int, []string) {
-	log := logf.Log.WithName("allocateInterfaces").WithValues(
-		"networkConfiguration", nc.Name, "namespace", nc.Namespace)
-
-	_, ipNet, _ := net.ParseCIDR(staticCfg.IPv4CIDR)
-
-	var statusInterfaces []vitistackcrdsv1alpha1.NetworkConfigurationInterface
-	var errMsgs []string
-	allocCount := 0
-
-	// Build a set of IPs already assigned to this NC's interfaces (from status)
-	// so we can try to keep them stable
-	existingIPs := make(map[string]string) // iface name -> IP
-	for _, si := range nc.Status.NetworkInterfaces {
-		if si.AllocationMethod == vitistackcrdsv1alpha1.IPAllocationTypeStatic && len(si.IPv4Addresses) > 0 {
-			existingIPs[si.Name] = si.IPv4Addresses[0]
+// indexIPAllocations maps IPAllocations by interface name and reports whether
+// every one has reached the Allocated phase.
+func indexIPAllocations(ipaList *vitistackcrdsv1alpha2.IPAllocationList) (map[string]*vitistackcrdsv1alpha2.IPAllocation, bool) {
+	byInterface := make(map[string]*vitistackcrdsv1alpha2.IPAllocation)
+	allAllocated := true
+	for i := range ipaList.Items {
+		ipa := &ipaList.Items[i]
+		byInterface[ipa.Spec.InterfaceName] = ipa
+		if ipa.Status.Phase != vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			allAllocated = false
 		}
 	}
+	return byInterface, allAllocated
+}
 
-	var expiry *metav1.Time
-	if staticCfg.TTLSeconds > 0 {
-		t := metav1.NewTime(time.Now().Add(time.Duration(staticCfg.TTLSeconds) * time.Second))
-		expiry = &t
-	}
-
+// buildStatusInterfaces assembles the NetworkConfiguration status interface list
+// from the per-interface IPAllocation results, returning the list and the number
+// of interfaces that received an address.
+func buildStatusInterfaces(
+	nc *vitistackcrdsv1alpha1.NetworkConfiguration,
+	ipaByInterface map[string]*vitistackcrdsv1alpha2.IPAllocation,
+	ipNet *net.IPNet,
+) ([]vitistackcrdsv1alpha1.NetworkConfigurationInterface, int) {
+	statusInterfaces := make([]vitistackcrdsv1alpha1.NetworkConfigurationInterface, 0, len(nc.Spec.NetworkInterfaces))
+	allocCount := 0
 	for _, iface := range nc.Spec.NetworkInterfaces {
 		statusIface := vitistackcrdsv1alpha1.NetworkConfigurationInterface{
 			Name:       iface.Name,
 			MacAddress: iface.MacAddress,
 			Vlan:       iface.Vlan,
 		}
-
-		// Try to keep the existing allocation if still in range and not taken by others
-		var assignedIP string
-		if existing, ok := existingIPs[iface.Name]; ok {
-			ip := net.ParseIP(existing)
-			if ip != nil && isIPInRange(ip, rangeStart, rangeEnd) {
-				if _, taken := allocatedIPs[existing]; !taken {
-					assignedIP = existing
-					log.Info("keeping existing IP allocation for interface",
-						"interface", iface.Name, "ip", assignedIP)
-				} else {
-					log.Info("WARNING: existing IP for interface is now taken by another NetworkConfiguration, will reallocate",
-						"interface", iface.Name, "previousIP", existing)
-				}
-			} else if ip != nil {
-				log.Info("WARNING: existing IP for interface is outside current range, will reallocate",
-					"interface", iface.Name, "previousIP", existing,
-					"rangeStart", rangeStart.String(), "rangeEnd", rangeEnd.String())
+		if ipa, ok := ipaByInterface[iface.Name]; ok && ipa.Status.Phase == vitistackcrdsv1alpha2.IPAllocationPhaseAllocated {
+			statusIface.IPv4Addresses = []string{ipa.Status.Address}
+			statusIface.IPv4Subnet = ipNet.String()
+			statusIface.IPv4Gateway = ipa.Status.Gateway
+			statusIface.DNS = ipa.Status.DNS
+			statusIface.IPAllocated = true
+			statusIface.AllocationMethod = vitistackcrdsv1alpha1.IPAllocationTypeStatic
+			if ipa.Status.ExpiresAt != nil {
+				statusIface.AllocationExpiry = ipa.Status.ExpiresAt
 			}
+			allocCount++
 		}
-
-		// Otherwise allocate the next available
-		if assignedIP == "" {
-			nextIP := findNextAvailableIP(rangeStart, rangeEnd, allocatedIPs, staticCfg.IPv4Gateway)
-			if nextIP == "" {
-				log.Error(nil, "no available IPs in range for interface",
-					"interface", iface.Name,
-					"rangeStart", rangeStart.String(), "rangeEnd", rangeEnd.String(),
-					"allocatedCount", len(allocatedIPs))
-				errMsgs = append(errMsgs, fmt.Sprintf("no available IPs for interface %s", iface.Name))
-				statusInterfaces = append(statusInterfaces, statusIface)
-				continue
-			}
-			assignedIP = nextIP
-			log.Info("allocated new IP for interface",
-				"interface", iface.Name, "ip", assignedIP)
-		}
-
-		// Mark as allocated so subsequent interfaces don't get the same IP
-		allocatedIPs[assignedIP] = struct{}{}
-
-		statusIface.IPv4Addresses = []string{assignedIP}
-		statusIface.IPv4Subnet = ipNet.String()
-		statusIface.IPv4Gateway = staticCfg.IPv4Gateway
-		statusIface.DNS = staticCfg.DNS
-		statusIface.IPAllocated = true
-		statusIface.AllocationMethod = vitistackcrdsv1alpha1.IPAllocationTypeStatic
-		statusIface.AllocationExpiry = expiry
-		allocCount++
-
 		statusInterfaces = append(statusInterfaces, statusIface)
 	}
-
-	return statusInterfaces, allocCount, errMsgs
+	return statusInterfaces, allocCount
 }
 
 // collectAllocatedIPs lists all NetworkConfigurations in the namespace that reference
@@ -471,39 +440,87 @@ func (r *NetworkConfigurationReconciler) handleDeletion(ctx context.Context, nc 
 		return ctrl.Result{}, nil
 	}
 
-	// Collect remaining allocations (the deleted NC is excluded because its finalizer is gone)
-	allocatedIPs, err := r.collectAllocatedIPs(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName, nc.Name)
-	if err != nil {
-		log.Error(err, "failed to collect allocated IPs during deletion cleanup")
-		return ctrl.Result{}, nil
-	}
-
-	// Also collect the ownership map for the status
+	// Collect the remaining allocations (the deleted NC is excluded because its
+	// finalizer is gone). This list is the single source of truth for both the
+	// count and the ownership entries written to the NetworkNamespace status.
 	allocatedIPEntries, err := r.collectAllocatedIPEntries(ctx, nc.Namespace, nc.Spec.NetworkNamespaceName, nc.Name)
 	if err != nil {
 		log.Error(err, "failed to collect allocated IP entries during deletion cleanup")
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, allocatedIPs, 0, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
+	if err := r.updateNetworkNamespaceIPAllocationStatus(ctx, nn, staticCfg, rangeStart, rangeEnd, allocatedIPEntries); err != nil {
 		log.Error(err, "failed to update NetworkNamespace IP allocation status during deletion cleanup")
 	}
 
 	return ctrl.Result{}, nil
 }
 
+// ensureIPAllocations creates an IPAllocation CR for each interface in the
+// NetworkConfiguration that doesn't already have one. Each IPAllocation is
+// owned by the NC (via ownerReference) so it's garbage-collected on NC deletion.
+func (r *NetworkConfigurationReconciler) ensureIPAllocations(
+	ctx context.Context,
+	nc *vitistackcrdsv1alpha1.NetworkConfiguration,
+	nn *vitistackcrdsv1alpha1.NetworkNamespace,
+) error {
+	log := logf.FromContext(ctx)
+
+	// List existing IPAllocations for this NC
+	existing := &vitistackcrdsv1alpha2.IPAllocationList{}
+	if err := r.List(ctx, existing, client.InNamespace(nc.Namespace),
+		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name}); err != nil {
+		return fmt.Errorf("listing existing IPAllocations: %w", err)
+	}
+
+	existingByIface := make(map[string]bool)
+	for i := range existing.Items {
+		existingByIface[existing.Items[i].Spec.InterfaceName] = true
+	}
+
+	for _, iface := range nc.Spec.NetworkInterfaces {
+		if existingByIface[iface.Name] {
+			continue
+		}
+
+		ipaName := fmt.Sprintf("%s-%s", nc.Name, iface.Name)
+		ipa := &vitistackcrdsv1alpha2.IPAllocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ipaName,
+				Namespace: nc.Namespace,
+				Labels: map[string]string{
+					vitistackcrdsv1alpha2.LabelNetworkNamespace:     nn.Name,
+					vitistackcrdsv1alpha2.LabelNetworkConfiguration: nc.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: vitistackcrdsv1alpha1.GroupVersion.String(),
+						Kind:       "NetworkConfiguration",
+						Name:       nc.Name,
+						UID:        nc.UID,
+					},
+				},
+			},
+			Spec: vitistackcrdsv1alpha2.IPAllocationSpec{
+				NetworkNamespaceName:     nn.Name,
+				NetworkConfigurationName: nc.Name,
+				InterfaceName:            iface.Name,
+			},
+		}
+
+		if err := r.Create(ctx, ipa); err != nil {
+			return fmt.Errorf("creating IPAllocation %s: %w", ipaName, err)
+		}
+		log.Info("created IPAllocation for interface",
+			"ipAllocation", ipaName, "interface", iface.Name,
+			"networkConfiguration", nc.Name, "networkNamespace", nn.Name)
+	}
+
+	return nil
+}
+
 // getNetworkNamespace fetches the NetworkNamespace by name or via legacy list
-// fallback. Returns:
-//   - nn: the fetched NetworkNamespace.
-//   - fallbackUsed: true if the legacy list-and-pick-first path was taken.
-//   - listCount: when fallbackUsed is true, the number of NNs found in the
-//     namespace; otherwise 0. Callers can use this to decide whether to warn
-//     about ambiguity (multiple NNs in one namespace).
-//   - err: any fetch/list error, or a strict-mode refusal when
-//     STATIC_IP_STRICT_DEFAULTS is enabled and networkNamespaceName is empty.
-//
-// No logs are emitted here so callers can silently triage NCs that belong to
-// another operator and only warn once ownership is confirmed.
+// fallback.
 func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context, namespace, networkNamespaceName string) (*vitistackcrdsv1alpha1.NetworkNamespace, bool, int, error) {
 	var nn vitistackcrdsv1alpha1.NetworkNamespace
 
@@ -514,7 +531,7 @@ func (r *NetworkConfigurationReconciler) getNetworkNamespace(ctx context.Context
 		return &nn, false, 0, nil
 	}
 
-	if strictDefaultsEnabled() {
+	if settings.StrictDefaults() {
 		return nil, true, 0, fmt.Errorf("spec.networkNamespaceName is not set and STATIC_IP_STRICT_DEFAULTS is enabled; refusing to fall back to listing NetworkNamespaces. Set spec.networkNamespaceName explicitly")
 	}
 
@@ -535,15 +552,22 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 	ctx context.Context,
 	nn *vitistackcrdsv1alpha1.NetworkNamespace,
 	staticCfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig,
-	allocatedIPs map[string]struct{},
-	newAllocations int,
 	rangeStart, rangeEnd net.IP,
 	allocatedIPEntries []vitistackcrdsv1alpha1.AllocatedIPEntry,
 ) error {
 	log := logf.FromContext(ctx)
 
-	totalCount := int32(ipCount(rangeStart, rangeEnd))                 // #nosec G115 -- max 253 for /24, well within int32
-	allocatedCount := int32(len(allocatedIPs)) + int32(newAllocations) // #nosec G115 -- bounded by totalCount
+	// allocatedIPEntries is the authoritative set of allocated IPs in this
+	// NetworkNamespace, so the count and the list are derived from a single
+	// source and can never disagree. Deriving the count from a self-excluding
+	// set previously undercounted by the reconciling NC's own allocations.
+	totalCount := int32(ipCount(rangeStart, rangeEnd)) // #nosec G115 -- max 253 for /24, well within int32
+	allocatedCount := int32(len(allocatedIPEntries))   // #nosec G115 -- bounded by totalCount
+
+	// Sort entries by IP so the persisted list is deterministic. The cache List
+	// that produces these entries returns map-iteration order, so without this
+	// the list would reorder between reconciles and defeat the no-op guard below.
+	sortAllocatedIPEntries(allocatedIPEntries)
 
 	base := nn.DeepCopy()
 	updated := nn.DeepCopy()
@@ -564,6 +588,16 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 	updated.Status.IPAllocationStatus.AvailableCount = totalCount - allocatedCount
 	updated.Status.IPAllocationStatus.AllocatedIPs = allocatedIPEntries
 
+	// Skip the write (and the misleading "updated" log) when nothing changed.
+	// Reconcile is level-triggered and fires for every object on cache sync, so
+	// most reconciles are no-ops; patching unconditionally churns the apiserver
+	// and emits a status event that needlessly re-triggers reconciles.
+	if apiequality.Semantic.DeepEqual(base.Status, updated.Status) {
+		log.V(1).Info("NetworkNamespace IP allocation status already up to date",
+			"networkNamespace", nn.Name, "namespace", nn.Namespace)
+		return nil
+	}
+
 	if err := r.Status().Patch(ctx, updated, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("failed to patch NetworkNamespace %s/%s status: %w", nn.Namespace, nn.Name, err)
 	}
@@ -574,6 +608,20 @@ func (r *NetworkConfigurationReconciler) updateNetworkNamespaceIPAllocationStatu
 		"totalIPs", totalCount, "allocated", allocatedCount, "available", totalCount-allocatedCount)
 
 	return nil
+}
+
+// sortAllocatedIPEntries orders entries by IP address so the persisted list is
+// stable across reconciles regardless of the (map-iteration) order the cache
+// returns. A stable order is what lets the DeepEqual no-op guard skip redundant
+// status writes.
+func sortAllocatedIPEntries(entries []vitistackcrdsv1alpha1.AllocatedIPEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		a, b := net.ParseIP(entries[i].IP), net.ParseIP(entries[j].IP)
+		if a != nil && b != nil {
+			return bytes.Compare(a, b) < 0
+		}
+		return entries[i].IP < entries[j].IP
+	})
 }
 
 // NewNetworkConfigurationReconciler creates a new reconciler.
@@ -588,7 +636,11 @@ func NewNetworkConfigurationReconciler(mgr ctrl.Manager) *NetworkConfigurationRe
 func (r *NetworkConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
+		// IPAllocations are created with an ownerReference to the NC, so this
+		// watch re-reconciles the NC when its allocations change phase (e.g.
+		// Pending->Allocated, TTL renewal) — replacing the old 10s poll.
+		Owns(&vitistackcrdsv1alpha2.IPAllocation{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: settings.MaxConcurrentReconciles()}).
 		Named("networkconfiguration").
 		Complete(r)
 }
@@ -633,6 +685,11 @@ func (r *NetworkConfigurationReconciler) updateStatus(
 	}
 	if networkInterfaces != nil {
 		updated.Status.NetworkInterfaces = networkInterfaces
+	}
+
+	// Skip redundant writes on no-op reconciles (mirrors setCondition).
+	if apiequality.Semantic.DeepEqual(base.Status, updated.Status) {
+		return nil
 	}
 
 	if err := r.Status().Patch(ctx, updated, client.MergeFrom(base)); err != nil {
@@ -698,6 +755,11 @@ func parseIPRange(cfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig) (net.IP, 
 		return nil, nil, fmt.Errorf("invalid IPv4CIDR %q: %w", cfg.IPv4CIDR, err)
 	}
 
+	// The first four addresses of the prefix (network, gateway, and two reserved)
+	// are not allocatable. rangeStart defaults to this floor and may not be set
+	// below it.
+	floor := nextIP(ipNet.IP.To4(), 4)
+
 	var rangeStart, rangeEnd net.IP
 
 	if cfg.IPv4RangeStart != "" {
@@ -705,9 +767,12 @@ func parseIPRange(cfg *vitistackcrdsv1alpha1.StaticIPAllocationConfig) (net.IP, 
 		if rangeStart == nil {
 			return nil, nil, fmt.Errorf("invalid IPv4RangeStart %q", cfg.IPv4RangeStart)
 		}
+		if ipToUint32(rangeStart) < ipToUint32(floor) {
+			return nil, nil, fmt.Errorf("ipv4RangeStart %s is below the minimum allowed start %s for CIDR %s (the first 4 addresses are reserved)", rangeStart, floor, cfg.IPv4CIDR)
+		}
 	} else {
-		// Default: network address + 2 (skip network and gateway)
-		rangeStart = nextIP(ipNet.IP.To4(), 2)
+		// Default: network address + 4 (skip network, gateway, and two reserved)
+		rangeStart = floor
 	}
 
 	if cfg.IPv4RangeEnd != "" {
@@ -748,6 +813,67 @@ func findNextAvailableIP(rangeStart, rangeEnd net.IP, allocated map[string]struc
 func isIPInRange(ip, rangeStart, rangeEnd net.IP) bool {
 	ipVal := ipToUint32(ip.To4())
 	return ipVal >= ipToUint32(rangeStart) && ipVal <= ipToUint32(rangeEnd)
+}
+
+// effectiveStaticConfig resolves the static IP pool to allocate from. An explicit
+// spec.ipAllocation.static is used as-is for any field the user set; any missing
+// pool field is filled from the NAM-provisioned status: status.ipv4Prefix supplies
+// the CIDR, status.vlanId the VLAN, and the gateway defaults to the first host of
+// the CIDR (NAM does not return a gateway). Returns an error when no CIDR can be
+// determined from either source. The spec is never mutated (cfg is a copy).
+func effectiveStaticConfig(nn *vitistackcrdsv1alpha1.NetworkNamespace) (*vitistackcrdsv1alpha1.StaticIPAllocationConfig, error) {
+	cfg := vitistackcrdsv1alpha1.StaticIPAllocationConfig{}
+	if nn.Spec.IPAllocation != nil && nn.Spec.IPAllocation.Static != nil {
+		cfg = *nn.Spec.IPAllocation.Static
+	}
+
+	if cfg.IPv4CIDR == "" {
+		cfg.IPv4CIDR = strings.TrimSpace(nn.Status.IPv4Prefix)
+	}
+	if cfg.IPv4CIDR == "" {
+		return nil, fmt.Errorf("NetworkNamespace %s has type 'static' but no ipv4CIDR in spec.ipAllocation.static and no provisioned status.ipv4Prefix", nn.Name)
+	}
+
+	if cfg.VlanID == 0 && nn.Status.VlanID != 0 {
+		cfg.VlanID = nn.Status.VlanID
+	}
+
+	if cfg.IPv4Gateway == "" {
+		gw, err := firstHost(cfg.IPv4CIDR)
+		if err != nil {
+			return nil, err
+		}
+		cfg.IPv4Gateway = gw
+	}
+
+	// NAM provisions a prefix but no DNS. When no DNS is configured anywhere,
+	// default it to the gateway (the common home/simple-network case where the
+	// gateway also serves DNS). A fresh slice is assigned so the spec's DNS slice
+	// is never mutated.
+	if len(cfg.DNS) == 0 {
+		cfg.DNS = []string{cfg.IPv4Gateway}
+	}
+
+	return &cfg, nil
+}
+
+// firstHost returns the first usable host address of a CIDR (network address + 1).
+// It is used as the default gateway when one is not provided (e.g. a NAM-provisioned
+// prefix, which has no associated gateway).
+func firstHost(cidr string) (string, error) {
+	_, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return "", fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+	}
+	base := ipNet.IP.To4()
+	if base == nil {
+		return "", fmt.Errorf("CIDR %q is not IPv4", cidr)
+	}
+	gw := nextIP(base, 1)
+	if gw == nil {
+		return "", fmt.Errorf("cannot derive gateway from CIDR %q", cidr)
+	}
+	return gw.String(), nil
 }
 
 func ipToUint32(ip net.IP) uint32 {

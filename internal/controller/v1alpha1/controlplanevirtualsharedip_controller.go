@@ -27,6 +27,7 @@ import (
 	viticommonfinalizers "github.com/vitistack/common/pkg/operator/finalizers"
 	reconcileutil "github.com/vitistack/common/pkg/operator/reconcileutil"
 	vitistackcrdsv1alpha1 "github.com/vitistack/common/pkg/v1alpha1"
+	"github.com/vitistack/static-ip-operator/internal/settings"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -65,6 +66,15 @@ func (r *ControlPlaneVirtualSharedIPReconciler) Reconcile(ctx context.Context, r
 	}
 
 	// --- Triage phase: determine ownership silently before any INFO logs. ---
+	// Ownership is selected by CPVSharedIP.spec.provider (set by the talos-operator's
+	// LOADBALANCER_PROVIDER), NOT the NetworkNamespace's ipAllocation.provider. This
+	// operator owns only CPVIPs whose provider is "static-ip-operator"; everything
+	// else (including the default "nam") belongs to another operator.
+	if !vitistackcrdsv1alpha1.MatchesProvider(cpvip.Spec.Provider, vitistackcrdsv1alpha1.ProviderNameStaticIP) {
+		log.V(1).Info("skipping ControlPlaneVirtualSharedIP, spec.provider is not static-ip-operator",
+			"name", cpvip.Name, "namespace", req.Namespace, "provider", cpvip.Spec.Provider)
+		return ctrl.Result{}, nil
+	}
 
 	nnName := strings.TrimSpace(cpvip.Spec.NetworkNamespaceIdentifier)
 	if nnName == "" {
@@ -76,9 +86,7 @@ func (r *ControlPlaneVirtualSharedIPReconciler) Reconcile(ctx context.Context, r
 	nn := &vitistackcrdsv1alpha1.NetworkNamespace{}
 	if err := r.Get(ctx, client.ObjectKey{Name: nnName, Namespace: req.Namespace}, nn); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Can't determine ownership without the NN. Requeue so we pick
-			// it up when the NN is created, but don't log at INFO — the CPVIP
-			// may belong to another operator.
+			// This CPVIP is ours, but its NetworkNamespace isn't created yet — requeue.
 			log.V(1).Info("referenced NetworkNamespace not found, requeuing",
 				"networkNamespace", nnName, "name", cpvip.Name, "namespace", req.Namespace)
 			return ctrl.Result{RequeueAfter: cpvipRequeueDelay}, nil
@@ -86,18 +94,7 @@ func (r *ControlPlaneVirtualSharedIPReconciler) Reconcile(ctx context.Context, r
 		return ctrl.Result{}, err
 	}
 
-	// Only handle NetworkNamespaces that explicitly use static-ip-operator
-	// (type=static AND provider=static-ip-operator). Everything else belongs
-	// to another operator — skip silently so we don't spam logs.
-	if nn.Spec.IPAllocation == nil ||
-		nn.Spec.IPAllocation.Type != vitistackcrdsv1alpha1.IPAllocationTypeStatic ||
-		!vitistackcrdsv1alpha1.MatchesProvider(nn.Spec.IPAllocation.Provider, vitistackcrdsv1alpha1.ProviderNameStaticIP) {
-		log.V(1).Info("skipping ControlPlaneVirtualSharedIP, NetworkNamespace does not use static-ip-operator",
-			"networkNamespace", nnName)
-		return ctrl.Result{}, nil
-	}
-
-	// --- Past triage: this CPVIP is ours. ---
+	// --- Past triage: this CPVIP is ours (spec.provider == static-ip-operator). ---
 
 	log.Info("reconciling ControlPlaneVirtualSharedIP",
 		"name", cpvip.Name, "namespace", req.Namespace, "generation", cpvip.GetGeneration())
@@ -344,7 +341,7 @@ func (r *ControlPlaneVirtualSharedIPReconciler) SetupWithManager(mgr ctrl.Manage
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&vitistackcrdsv1alpha1.ControlPlaneVirtualSharedIP{}).
 		Owns(&vitistackcrdsv1alpha1.NetworkConfiguration{}).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles()}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: settings.MaxConcurrentReconciles()}).
 		Named("controlplanevirtualsharedip").
 		Complete(r)
 }
