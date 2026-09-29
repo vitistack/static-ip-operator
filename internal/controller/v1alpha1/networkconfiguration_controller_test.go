@@ -485,3 +485,109 @@ func TestUpdateNNStatus_WritesWhenChanged(t *testing.T) {
 		t.Errorf("adding an allocation must rewrite NN status, but no patch occurred")
 	}
 }
+
+// TestEnsureIPAllocations_ReadoptsAddressFromNCStatus covers the case where an
+// IPAllocation is missing but the NC status still records the address the node
+// is running with — deleted out-of-band, or an NC that predates the IPAllocation
+// flow. The recreated IPAllocation must request that address, otherwise selectIP
+// hands out the next free one and the node is silently renumbered.
+func TestEnsureIPAllocations_ReadoptsAddressFromNCStatus(t *testing.T) {
+	scheme := newTestScheme(t)
+	nn, nc, _ := stdConvergedFixture()
+	ifaceName := nc.Spec.NetworkInterfaces[0].Name
+
+	nc.Status.NetworkInterfaces = []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+		Name:             ifaceName,
+		IPv4Addresses:    []string{testAddr2},
+		IPv4Gateway:      testGatewayIP,
+		IPAllocated:      true,
+		AllocationMethod: vitistackcrdsv1alpha1.IPAllocationTypeStatic,
+	}}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(nn, nc).
+		WithStatusSubresource(nn, nc).
+		Build()
+
+	r := &NetworkConfigurationReconciler{Client: cl, Scheme: scheme}
+	if err := r.ensureIPAllocations(context.Background(), nc, nn); err != nil {
+		t.Fatalf("ensureIPAllocations: %v", err)
+	}
+
+	created := &vitistackcrdsv1alpha2.IPAllocation{}
+	key := types.NamespacedName{Name: nc.Name + "-" + ifaceName, Namespace: nc.Namespace}
+	if err := cl.Get(context.Background(), key, created); err != nil {
+		t.Fatalf("get recreated IPAllocation: %v", err)
+	}
+	if created.Spec.RequestedAddress != testAddr2 {
+		t.Errorf("RequestedAddress = %q, want %q (node would be renumbered)",
+			created.Spec.RequestedAddress, testAddr2)
+	}
+}
+
+func TestExistingAddressForInterface(t *testing.T) {
+	const iface = "vlan2122"
+	tests := []struct {
+		name   string
+		ifaces []vitistackcrdsv1alpha1.NetworkConfigurationInterface
+		want   string
+	}{
+		{name: "no status", want: ""},
+		{
+			name: "static allocation is adopted",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: iface, IPv4Addresses: []string{testAddr1}, IPAllocated: true,
+				AllocationMethod: vitistackcrdsv1alpha1.IPAllocationTypeStatic,
+			}},
+			want: testAddr1,
+		},
+		{
+			name: "legacy entry without AllocationMethod is adopted",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: iface, IPv4Addresses: []string{testAddr1}, IPAllocated: true,
+			}},
+			want: testAddr1,
+		},
+		{
+			name: "dhcp allocation is ignored",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: iface, IPv4Addresses: []string{testAddr1}, IPAllocated: true,
+				AllocationMethod: vitistackcrdsv1alpha1.IPAllocationTypeDHCP,
+			}},
+			want: "",
+		},
+		{
+			name: "not yet allocated is ignored",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: iface, IPv4Addresses: []string{testAddr1},
+			}},
+			want: "",
+		},
+		{
+			name: "other interface is ignored",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: "eth9", IPv4Addresses: []string{testAddr1}, IPAllocated: true,
+			}},
+			want: "",
+		},
+		{
+			name: "non-IPv4 address is skipped",
+			ifaces: []vitistackcrdsv1alpha1.NetworkConfigurationInterface{{
+				Name: iface, IPv4Addresses: []string{"not-an-ip", testAddr2}, IPAllocated: true,
+			}},
+			want: testAddr2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nc := &vitistackcrdsv1alpha1.NetworkConfiguration{
+				Status: vitistackcrdsv1alpha1.NetworkConfigurationStatus{NetworkInterfaces: tt.ifaces},
+			}
+			if got := existingAddressForInterface(nc, iface); got != tt.want {
+				t.Errorf("existingAddressForInterface() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
