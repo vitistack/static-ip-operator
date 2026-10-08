@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	viticommonconditions "github.com/vitistack/common/pkg/operator/conditions"
@@ -43,7 +44,16 @@ const (
 // configuration, and allocates the next available IP from the static range.
 type IPAllocationReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader reads straight from the API server, bypassing the informer
+	// cache. Allocation decisions must use it: the cache can lag our own
+	// status patches, which let back-to-back reconciles hand out the same IP.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+
+	// poolLocks serializes allocation per NetworkNamespace (key "ns/name") so
+	// raising the worker count can never let two reconciles pick from the
+	// same free set.
+	poolLocks sync.Map // map[string]*sync.Mutex
 }
 
 // +kubebuilder:rbac:groups=vitistack.io,resources=ipallocations,verbs=get;list;watch;create;update;patch;delete
@@ -110,9 +120,20 @@ func (r *IPAllocationReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 
+	// Everything from here to the status patch is one read-modify-write of the
+	// pool. Hold the pool lock across it and read live state, not the cache:
+	// the cache may not yet show the allocation the previous reconcile just
+	// patched, which is how two IPAllocations ended up with the same address.
+	unlock := r.lockPool(req.Namespace, nnName)
+	defer unlock()
+
+	if err := r.reader().Get(ctx, req.NamespacedName, ipa); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
 	// Collect all existing allocations for this NetworkNamespace
 	existingIPAs := &vitistackcrdsv1alpha2.IPAllocationList{}
-	if err := r.List(ctx, existingIPAs, client.InNamespace(req.Namespace),
+	if err := r.reader().List(ctx, existingIPAs, client.InNamespace(req.Namespace),
 		client.MatchingLabels{vitistackcrdsv1alpha2.LabelNetworkNamespace: nnName}); err != nil {
 		log.Error(err, "failed to list existing IPAllocations")
 		return ctrl.Result{RequeueAfter: ipaRequeueDelay}, nil
@@ -292,6 +313,24 @@ func selectIP(
 	return assignedIP
 }
 
+// reader returns the uncached API reader, falling back to the (cached) client
+// when none was wired, e.g. in tests that only set Client.
+func (r *IPAllocationReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// lockPool locks the allocation pool of one NetworkNamespace and returns the
+// matching unlock.
+func (r *IPAllocationReconciler) lockPool(namespace, nnName string) func() {
+	m, _ := r.poolLocks.LoadOrStore(namespace+"/"+nnName, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
 // ipCountFromIPs counts IPs between two IP addresses (inclusive).
 func ipCountFromIPs(rangeStart, rangeEnd net.IP) int {
 	start := binary.BigEndian.Uint32(rangeStart.To4())
@@ -302,8 +341,9 @@ func ipCountFromIPs(rangeStart, rangeEnd net.IP) int {
 // NewIPAllocationReconciler creates a new reconciler.
 func NewIPAllocationReconciler(mgr ctrl.Manager) *IPAllocationReconciler {
 	return &IPAllocationReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
 	}
 }
 
