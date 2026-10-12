@@ -5,6 +5,13 @@
 # This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
 replicaCount: 1
 
+# Only the elected leader runs the controllers; other replicas wait as hot
+# standbys. Keep this on whenever replicaCount > 1: IP allocation is only
+# serialized within one process, so two active replicas can hand out the same
+# address.
+leaderElection:
+  enabled: true
+
 # Maximum number of objects reconciled in parallel per controller (env var
 # MAX_CONCURRENT_RECONCILES). The workqueue serializes by object key, so this
 # only parallelizes across distinct objects, never the same one. Defaults to 5.

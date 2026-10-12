@@ -11,7 +11,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // TestIPAllocationReconcile_NamStaticNoStaticBlock covers the "static-via-NAM"
@@ -157,5 +159,83 @@ func TestUpdateNNSummary_SkipsUnchangedWrite(t *testing.T) {
 	}
 	if counts.nn == 0 {
 		t.Errorf("changed allocation count must rewrite NN status, but no patch occurred")
+	}
+}
+
+// TestIPAllocationReconcile_StaleCacheNoDuplicate reproduces the 2026-09-25
+// q-viti-osl-xcads-yuvh collision: ctp0 and wrk0 were reconciled back to back
+// and both got 100.64.4.59, because the "taken" set was listed from the
+// informer cache before it had seen the first allocation's status patch. The
+// cached client here never sees any allocation; the reconciler must still hand
+// out distinct addresses by reading the live state.
+func TestIPAllocationReconcile_StaleCacheNoDuplicate(t *testing.T) {
+	scheme := newTestScheme(t)
+
+	const ns = testNamespace
+	const nnName = "test-static-networknamespace"
+
+	nn := &vitistackcrdsv1alpha1.NetworkNamespace{
+		ObjectMeta: metav1.ObjectMeta{Name: nnName, Namespace: ns},
+		Spec: vitistackcrdsv1alpha1.NetworkNamespaceSpec{
+			IPAllocation: &vitistackcrdsv1alpha1.NetworkNamespaceIPAllocation{
+				Type: vitistackcrdsv1alpha1.IPAllocationTypeStatic,
+			},
+		},
+		Status: vitistackcrdsv1alpha1.NetworkNamespaceStatus{
+			IPv4Prefix:        testIPv4Prefix,
+			ProvisioningPhase: string(vitistackcrdsv1alpha2.ProvisioningPhaseReady),
+		},
+	}
+	newIPA := func(name string) *vitistackcrdsv1alpha2.IPAllocation {
+		return &vitistackcrdsv1alpha2.IPAllocation{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: ns,
+				Labels:    map[string]string{vitistackcrdsv1alpha2.LabelNetworkNamespace: nnName},
+			},
+			Spec: vitistackcrdsv1alpha2.IPAllocationSpec{NetworkNamespaceName: nnName, InterfaceName: "vlan2122"},
+		}
+	}
+	a, b := newIPA("ipa-ctp0"), newIPA("ipa-wrk0")
+
+	live := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(nn, a, b).
+		WithStatusSubresource(nn, a, b).
+		Build()
+
+	// The cache lags: every IPAllocation list returns only unallocated objects.
+	stale := interceptor.NewClient(live, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if l, ok := list.(*vitistackcrdsv1alpha2.IPAllocationList); ok {
+				l.Items = []vitistackcrdsv1alpha2.IPAllocation{*a, *b}
+				return nil
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+
+	r := &IPAllocationReconciler{Client: stale, APIReader: live, Scheme: scheme}
+	for _, name := range []string{a.Name, b.Name} {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+		}); err != nil {
+			t.Fatalf("Reconcile %s: %v", name, err)
+		}
+	}
+
+	got := map[string]string{}
+	for _, name := range []string{a.Name, b.Name} {
+		ipa := &vitistackcrdsv1alpha2.IPAllocation{}
+		if err := live.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, ipa); err != nil {
+			t.Fatalf("get %s: %v", name, err)
+		}
+		if ipa.Status.Address == "" {
+			t.Fatalf("%s: no address allocated (phase %q, message %q)", name, ipa.Status.Phase, ipa.Status.Message)
+		}
+		got[name] = ipa.Status.Address
+	}
+	if got[a.Name] == got[b.Name] {
+		t.Fatalf("duplicate allocation: %s and %s both got %s", a.Name, b.Name, got[a.Name])
 	}
 }
