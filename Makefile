@@ -274,7 +274,8 @@ ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= latest
-GOSEC_VERSION ?= latest
+# Includes golang.org/x/tools support for Go 1.27 export data.
+GOSEC_VERSION ?= v2.29.1-0.20261009120814-7b1b5cebe007
 GOVULNCHECK_VERSION ?= latest
 
 .PHONY: kustomize
@@ -311,9 +312,9 @@ install-security-scanner: $(GOSEC) ## Install gosec security scanner locally (st
 $(GOSEC): $(LOCALBIN)
 	@set -e; echo "Attempting to install gosec $(GOSEC_VERSION)"; \
 	if ! GOBIN=$(LOCALBIN) go install github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) 2>/dev/null; then \
-		echo "Primary install failed, attempting install from @main (compatibility fallback)"; \
-		if ! GOBIN=$(LOCALBIN) go install github.com/securego/gosec/v2/cmd/gosec@main; then \
-			echo "gosec installation failed for versions $(GOSEC_VERSION) and @main"; \
+		echo "Primary install failed, attempting install from @master (compatibility fallback)"; \
+		if ! GOBIN=$(LOCALBIN) go install github.com/securego/gosec/v2/cmd/gosec@master; then \
+			echo "gosec installation failed for versions $(GOSEC_VERSION) and @master"; \
 			exit 1; \
 		fi; \
 	fi; \
