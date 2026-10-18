@@ -484,6 +484,10 @@ func (r *NetworkConfigurationReconciler) ensureIPAllocations(
 		}
 
 		ipaName := fmt.Sprintf("%s-%s", nc.Name, iface.Name)
+		// Re-request the address already in status so a recreated IPAllocation keeps
+		// the address the node is running with; selectIP falls back to a fresh one
+		// when it is out of range or taken.
+		requestedAddress := existingAddressForInterface(nc, iface.Name)
 		ipa := &vitistackcrdsv1alpha2.IPAllocation{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      ipaName,
@@ -505,6 +509,7 @@ func (r *NetworkConfigurationReconciler) ensureIPAllocations(
 				NetworkNamespaceName:     nn.Name,
 				NetworkConfigurationName: nc.Name,
 				InterfaceName:            iface.Name,
+				RequestedAddress:         requestedAddress,
 			},
 		}
 
@@ -513,10 +518,33 @@ func (r *NetworkConfigurationReconciler) ensureIPAllocations(
 		}
 		log.Info("created IPAllocation for interface",
 			"ipAllocation", ipaName, "interface", iface.Name,
-			"networkConfiguration", nc.Name, "networkNamespace", nn.Name)
+			"networkConfiguration", nc.Name, "networkNamespace", nn.Name,
+			"requestedAddress", requestedAddress)
 	}
 
 	return nil
+}
+
+// existingAddressForInterface returns the IPv4 address already recorded in the
+// NetworkConfiguration status for the named interface, or "" when there is none.
+func existingAddressForInterface(nc *vitistackcrdsv1alpha1.NetworkConfiguration, ifaceName string) string {
+	for i := range nc.Status.NetworkInterfaces {
+		iface := &nc.Status.NetworkInterfaces[i]
+		if iface.Name != ifaceName || !iface.IPAllocated {
+			continue
+		}
+		// Status written before AllocationMethod existed leaves it empty, so only an
+		// explicit dhcp marking disqualifies the address.
+		if iface.AllocationMethod == vitistackcrdsv1alpha1.IPAllocationTypeDHCP {
+			continue
+		}
+		for _, addr := range iface.IPv4Addresses {
+			if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+				return addr
+			}
+		}
+	}
+	return ""
 }
 
 // getNetworkNamespace fetches the NetworkNamespace by name or via legacy list
